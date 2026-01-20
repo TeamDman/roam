@@ -341,9 +341,13 @@ and a return type:
 // proto.rs
 
 #[roam::service]
-//└────┬────┘         Service definition
+//└────┬────┘
+//Service definition
+
 pub trait TemplateHost {
-//         └────┬─────┘  Service name
+//         └────┬─────┘
+//        Service name
+
     async fn load_template(&self, context_id: ContextId, name: String) -> LoadTemplateResult;
     //       └─────┬──────┘       └──────────────┬────────────────┘    └────────┬──────────┘
     //          Method                       Parameters                     Return type

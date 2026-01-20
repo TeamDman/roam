@@ -78,6 +78,7 @@ pub fn workspace_root() -> &'static std::path::Path {
 pub fn subject_cmd() -> String {
     match std::env::var("SUBJECT_CMD") {
         Ok(s) if !s.trim().is_empty() => s,
+        _ if cfg!(windows) => "./target/release/subject-rust.exe".to_string(),
         _ => "./target/release/subject-rust".to_string(),
     }
 }
@@ -162,10 +163,18 @@ pub async fn spawn_subject(peer_addr: &str) -> Result<Child, String> {
     let cmd = subject_cmd();
 
     // Use a shell so SUBJECT_CMD can be `node subject.js`, etc.
-    let mut child = Command::new("sh")
+    let mut cmd_builder = if cfg!(windows) {
+        let mut c = Command::new("powershell");
+        c.arg("-NoProfile").arg("-Command").arg(&cmd);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-lc").arg(&cmd);
+        c
+    };
+
+    let mut child = cmd_builder
         .current_dir(workspace_root())
-        .arg("-lc")
-        .arg(cmd)
         .env("PEER_ADDR", peer_addr)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -207,10 +216,18 @@ pub async fn spawn_subject_client(peer_addr: &str, scenario: &str) -> Result<Chi
     let cmd = subject_cmd();
 
     // Use a shell so SUBJECT_CMD can be `node subject.js`, etc.
-    let mut child = Command::new("sh")
+    let mut cmd_builder = if cfg!(windows) {
+        let mut c = Command::new("powershell");
+        c.arg("-NoProfile").arg("-Command").arg(&cmd);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-lc").arg(&cmd);
+        c
+    };
+
+    let mut child = cmd_builder
         .current_dir(workspace_root())
-        .arg("-lc")
-        .arg(cmd)
         .env("PEER_ADDR", peer_addr)
         .env("SUBJECT_MODE", "client")
         .env("CLIENT_SCENARIO", scenario)

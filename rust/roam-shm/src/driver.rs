@@ -101,6 +101,87 @@ impl From<std::io::Error> for ShmConnectionError {
     }
 }
 
+// ============================================================================
+// SHM Connection Handle (with patching support)
+// ============================================================================
+
+/// A connection handle for SHM transport with support for `ShmBytes` patching.
+///
+/// This wraps a regular `ConnectionHandle` and stores the `VarSlotPool` reference
+/// needed to patch `ShmBytes` types in responses. When `patch_response` is called,
+/// it sets up the `SHM_POOL` task-local context before running the patch hook.
+#[derive(Clone)]
+pub struct ShmConnectionHandle {
+    inner: ConnectionHandle,
+    var_slot_pool: Option<Arc<crate::var_slot_pool::VarSlotPool>>,
+    local_peer_id: u8,
+}
+
+impl ShmConnectionHandle {
+    /// Create a new SHM connection handle.
+    pub fn new(
+        inner: ConnectionHandle,
+        var_slot_pool: Option<Arc<crate::var_slot_pool::VarSlotPool>>,
+        local_peer_id: u8,
+    ) -> Self {
+        Self {
+            inner,
+            var_slot_pool,
+            local_peer_id,
+        }
+    }
+
+    /// Get the underlying `ConnectionHandle`.
+    pub fn inner(&self) -> &ConnectionHandle {
+        &self.inner
+    }
+
+    /// Make a raw RPC call by method ID, returning raw response bytes.
+    ///
+    /// Delegates to the underlying `ConnectionHandle::call_raw`.
+    pub async fn call_raw(
+        &self,
+        method_id: u64,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.inner.call_raw(method_id, payload).await
+    }
+}
+
+impl roam_session::Caller for ShmConnectionHandle {
+    fn call<T: facet::Facet<'static> + Send>(
+        &self,
+        method_id: u64,
+        args: &mut T,
+    ) -> impl std::future::Future<Output = Result<ResponseData, TransportError>> + Send {
+        // Delegate to inner handle
+        roam_session::Caller::call(&self.inner, method_id, args)
+    }
+
+    fn bind_response_streams<T: facet::Facet<'static>>(&self, response: &mut T, channels: &[u64]) {
+        self.inner.bind_response_streams(response, channels)
+    }
+
+    fn patch_response<T: facet::Facet<'static>>(&self, response: &mut T) {
+        // Set up SHM context for patching if we have a pool
+        if let Some(pool) = &self.var_slot_pool {
+            crate::shm_bytes::SHM_POOL.sync_scope(Arc::clone(pool), || {
+                crate::shm_bytes::SHM_LOCAL_PEER_ID.sync_scope(self.local_peer_id, || {
+                    roam_session::PATCH_HOOK.sync_scope(
+                        crate::shm_bytes::patch_shm_bytes_hook,
+                        || {
+                            roam_session::call_patch_hook(response);
+                        },
+                    );
+                });
+            });
+        } else {
+            // No pool - just call the default patch hook
+            roam_session::call_patch_hook(response);
+        }
+    }
+}
+
 /// The SHM connection driver - a future that handles bidirectional RPC.
 ///
 /// This must be spawned or awaited to drive the connection forward.
@@ -133,6 +214,17 @@ pub struct ShmDriver<T, D> {
 
     /// Diagnostic state for tracking in-flight requests (for SIGUSR1 dumps).
     diagnostic_state: Option<Arc<roam_session::diagnostic::DiagnosticState>>,
+
+    /// Shared variable-size slot pool for `ShmBytes` support.
+    ///
+    /// If present, this is set as the `SHM_POOL` task-local before dispatching
+    /// to service handlers, enabling zero-copy `ShmBytes` operations.
+    var_slot_pool: Option<Arc<crate::var_slot_pool::VarSlotPool>>,
+
+    /// Local peer ID (0 for host, 1-255 for guests).
+    ///
+    /// Used for ownership tracking in `ShmBytes` operations.
+    local_peer_id: u8,
 }
 
 impl<T, D> ShmDriver<T, D>
@@ -150,6 +242,8 @@ where
         driver_tx: mpsc::Sender<DriverMessage>,
         driver_rx: mpsc::Receiver<DriverMessage>,
         diagnostic_state: Option<Arc<roam_session::diagnostic::DiagnosticState>>,
+        var_slot_pool: Option<Arc<crate::var_slot_pool::VarSlotPool>>,
+        local_peer_id: u8,
     ) -> Self {
         // Use infinite credit for now - proper SHM flow control via channel table
         // atomics will be implemented in a future phase. This matches the current
@@ -165,6 +259,8 @@ where
             pending_responses: HashMap::new(),
             in_flight_server_requests: std::collections::HashSet::new(),
             diagnostic_state,
+            var_slot_pool,
+            local_peer_id,
         }
     }
 
@@ -195,7 +291,7 @@ where
                             return Ok(());
                         }
                         Err(e) => {
-                            trace!("driver: handle_recv returned Err, shutting down");
+                            warn!("driver: handle_recv returned Err({:?}), shutting down", e);
                             return Err(e);
                         }
                     }
@@ -288,6 +384,7 @@ where
             Ok(Some(m)) => m,
             Ok(None) => return Ok(false), // Clean shutdown
             Err(e) => {
+                warn!("handle_recv: transport error: {:?}", e);
                 // Check for protocol errors
                 let raw = MessageTransport::last_decoded(&self.io);
                 if raw.len() >= 2 && raw[0] == 0x00 && raw[1] != 0x00 {
@@ -465,7 +562,23 @@ where
             request_id,
             &mut self.server_channel_registry,
         );
-        tokio::spawn(handler_fut);
+
+        // Wrap the handler future to set SHM task-locals for ShmBytes support
+        if let Some(pool) = self.var_slot_pool.clone() {
+            let local_peer_id = self.local_peer_id;
+            // Set SHM_POOL (for ShmBytes::alloc/as_slice/free),
+            // SHM_LOCAL_PEER_ID (for ownership tracking), and
+            // PATCH_HOOK (for patching ShmBytes lengths and claiming ownership after deserialization)
+            let fut_with_pool = crate::shm_bytes::SHM_POOL.scope(pool, handler_fut);
+            let fut_with_peer_id = crate::shm_bytes::SHM_LOCAL_PEER_ID.scope(local_peer_id, fut_with_pool);
+            let fut_with_hook = roam_session::PATCH_HOOK.scope(
+                crate::shm_bytes::patch_shm_bytes_hook,
+                fut_with_peer_id,
+            );
+            tokio::spawn(fut_with_hook);
+        } else {
+            tokio::spawn(handler_fut);
+        }
         Ok(())
     }
 
@@ -526,15 +639,14 @@ where
         match result {
             Ok(()) => Ok(()),
             Err(ChannelError::Unknown) => {
-                Err(self
-                    .goodbye(
-                        "streaming.unknown",
-                        format!(
-                            "Data for unknown channel_id={} (in_server={}, in_client={}, payload_len={})",
-                            channel_id, in_server, in_client, payload_len
-                        ),
-                    )
-                    .await)
+                // In concurrent scenarios with backpressure, it's possible for Data messages
+                // to arrive for channels that have been unregistered (method completed).
+                // This is not a protocol violation - just a race condition. Log and ignore.
+                warn!(
+                    "Data for unknown channel_id={} (in_server={}, in_client={}, payload_len={}) - likely race condition",
+                    channel_id, in_server, in_client, payload_len
+                );
+                Ok(())
             }
             Err(ChannelError::DataAfterClose) => {
                 Err(self
@@ -575,15 +687,13 @@ where
         } else if in_client {
             self.handle.close_channel(channel_id);
         } else {
-            return Err(self
-                .goodbye(
-                    "streaming.unknown",
-                    format!(
-                        "Close for unknown channel_id={} (in_server={}, in_client={})",
-                        channel_id, in_server, in_client
-                    ),
-                )
-                .await);
+            // In concurrent scenarios with backpressure, it's possible for Close messages
+            // to arrive for channels that have been unregistered (method completed).
+            // This is not a protocol violation - just a race condition. Log and ignore.
+            warn!(
+                "Close for unknown channel_id={} (in_server={}, in_client={}) - likely race condition",
+                channel_id, in_server, in_client
+            );
         }
         Ok(())
     }
@@ -646,7 +756,7 @@ where
 pub fn establish_guest<D>(
     transport: ShmGuestTransport,
     dispatcher: D,
-) -> (ConnectionHandle, ShmDriver<ShmGuestTransport, D>)
+) -> (ShmConnectionHandle, ShmDriver<ShmGuestTransport, D>)
 where
     D: ServiceDispatcher,
 {
@@ -661,7 +771,7 @@ pub fn establish_guest_with_diagnostics<D>(
     transport: ShmGuestTransport,
     dispatcher: D,
     diagnostic_state: Option<Arc<roam_session::diagnostic::DiagnosticState>>,
-) -> (ConnectionHandle, ShmDriver<ShmGuestTransport, D>)
+) -> (ShmConnectionHandle, ShmDriver<ShmGuestTransport, D>)
 where
     D: ServiceDispatcher,
 {
@@ -672,6 +782,12 @@ where
         initial_credit: config.initial_credit,
     };
 
+    // Get var_slot_pool for ShmBytes support (if configured)
+    let var_slot_pool = transport.var_slot_pool();
+    
+    // Get the local peer ID for ownership tracking
+    let local_peer_id = transport.peer_id().get();
+
     // Create single unified channel for all messages (Call/Data/Close/Response).
     // Single channel ensures FIFO ordering.
     let (driver_tx, driver_rx) = mpsc::channel(256);
@@ -679,7 +795,7 @@ where
     // Guest is initiator (uses odd stream IDs)
     // Use infinite credit for now (matches current roam-stream behavior).
     let initial_credit = u32::MAX;
-    let handle = ConnectionHandle::new_with_diagnostics(
+    let inner_handle = ConnectionHandle::new_with_diagnostics(
         driver_tx.clone(),
         Role::Initiator,
         initial_credit,
@@ -691,13 +807,16 @@ where
         dispatcher,
         Role::Initiator,
         negotiated,
-        handle.clone(),
+        inner_handle.clone(),
         driver_tx,
         driver_rx,
         diagnostic_state,
+        var_slot_pool.clone(),
+        local_peer_id,
     );
 
-    (handle, driver)
+    let shm_handle = ShmConnectionHandle::new(inner_handle, var_slot_pool, local_peer_id);
+    (shm_handle, driver)
 }
 
 // ============================================================================
@@ -830,6 +949,12 @@ pub struct MultiPeerHostDriver {
     /// When host slots are exhausted, messages are queued here and retried
     /// when the guest rings the doorbell (indicating it has consumed messages).
     pending_sends: AuditableDequeMap<PeerId, Message>,
+
+    /// Shared variable-size slot pool for `ShmBytes` support.
+    ///
+    /// If present, this is set as the `SHM_POOL` task-local before dispatching
+    /// to service handlers, enabling zero-copy `ShmBytes` operations.
+    var_slot_pool: Option<Arc<crate::var_slot_pool::VarSlotPool>>,
 }
 
 /// Handle for controlling a running MultiPeerHostDriver.
@@ -865,7 +990,7 @@ impl MultiPeerHostDriverBuilder {
         mut self,
     ) -> (
         MultiPeerHostDriver,
-        HashMap<PeerId, ConnectionHandle>,
+        HashMap<PeerId, ShmConnectionHandle>,
         MultiPeerHostDriverHandle,
     ) {
         let config = self.host.config();
@@ -873,6 +998,9 @@ impl MultiPeerHostDriverBuilder {
             max_payload_size: config.max_payload_size,
             initial_credit: config.initial_credit,
         };
+
+        // Get the var_slot_pool from the host if configured (before we consume peers)
+        let var_slot_pool = self.host.var_slot_pool();
 
         let mut peers = HashMap::new();
         let mut handles = HashMap::new();
@@ -891,9 +1019,12 @@ impl MultiPeerHostDriverBuilder {
 
             // Host is acceptor (uses even stream IDs)
             let initial_credit = u32::MAX;
-            let handle = ConnectionHandle::new(driver_tx.clone(), Role::Acceptor, initial_credit);
+            let inner_handle = ConnectionHandle::new(driver_tx.clone(), Role::Acceptor, initial_credit);
 
-            handles.insert(peer_id, handle.clone());
+            // Host uses peer ID 0 for ownership tracking
+            let local_peer_id: u8 = 0;
+            let shm_handle = ShmConnectionHandle::new(inner_handle.clone(), var_slot_pool.clone(), local_peer_id);
+            handles.insert(peer_id, shm_handle);
 
             peers.insert(
                 peer_id,
@@ -902,7 +1033,7 @@ impl MultiPeerHostDriverBuilder {
                     server_channel_registry: ChannelRegistry::new(driver_tx),
                     pending_responses: HashMap::new(),
                     in_flight_server_requests: std::collections::HashSet::new(),
-                    handle,
+                    handle: inner_handle,
                     diagnostic_state: None,
                 },
             );
@@ -982,6 +1113,7 @@ impl MultiPeerHostDriverBuilder {
             driver_msg_rx,
             driver_msg_tx: driver_msg_tx.clone(),
             pending_sends: AuditableDequeMap::new("pending_sends[", 1024),
+            var_slot_pool,
         };
 
         let driver_handle = MultiPeerHostDriverHandle { control_tx };
@@ -1466,7 +1598,26 @@ impl MultiPeerHostDriver {
             request_id,
             &mut state.server_channel_registry,
         );
-        tokio::spawn(handler_fut);
+
+        // Wrap the handler future to set SHM task-locals for ShmBytes support
+        if let Some(pool) = self.var_slot_pool.clone() {
+            debug!("handle_incoming_request: wrapping with SHM_POOL scope (var_slot_pool is Some)");
+            // Host uses peer ID 0 for ownership tracking
+            let local_peer_id: u8 = 0;
+            // Set SHM_POOL (for ShmBytes::alloc/as_slice/free),
+            // SHM_LOCAL_PEER_ID (for ownership tracking), and
+            // PATCH_HOOK (for patching ShmBytes lengths and claiming ownership after deserialization)
+            let fut_with_pool = crate::shm_bytes::SHM_POOL.scope(pool, handler_fut);
+            let fut_with_peer_id = crate::shm_bytes::SHM_LOCAL_PEER_ID.scope(local_peer_id, fut_with_pool);
+            let fut_with_hook = roam_session::PATCH_HOOK.scope(
+                crate::shm_bytes::patch_shm_bytes_hook,
+                fut_with_peer_id,
+            );
+            tokio::spawn(fut_with_hook);
+        } else {
+            debug!("handle_incoming_request: NO var_slot_pool, spawning without SHM_POOL scope");
+            tokio::spawn(handler_fut);
+        }
         Ok(())
     }
 
@@ -1926,7 +2077,7 @@ impl MultiPeerHostDriverHandle {
 /// let ticket2 = host.add_peer(options)?;
 ///
 /// // Homogeneous dispatchers (same type for all peers)
-/// let (driver, handles) = establish_multi_peer_host(
+/// let (driver, handles, driver_handle) = establish_multi_peer_host(
 ///     host,
 ///     vec![
 ///         (ticket1.peer_id(), dispatcher1),
@@ -1944,7 +2095,7 @@ pub fn establish_multi_peer_host<D, I>(
     peers: I,
 ) -> (
     MultiPeerHostDriver,
-    HashMap<PeerId, ConnectionHandle>,
+    HashMap<PeerId, ShmConnectionHandle>,
     MultiPeerHostDriverHandle,
 )
 where

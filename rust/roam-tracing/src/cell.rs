@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use roam::session::ConnectionHandle;
+use roam::session::Caller;
 use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
@@ -289,16 +289,16 @@ impl CellTracingGuard {
     /// any real work. This ensures the tracing filter matches the host's `RUST_LOG`.
     ///
     /// Consumes the guard to prevent double-start.
-    pub async fn start(self, handle: ConnectionHandle) {
+    pub async fn start<C: Caller>(self, handle: C) {
         self.started
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.service.start(handle).await;
     }
 
     /// Start with custom batch size and flush interval.
-    pub async fn start_with_options(
+    pub async fn start_with_options<C: Caller>(
         self,
-        handle: ConnectionHandle,
+        handle: C,
         batch_size: usize,
         flush_interval: Duration,
     ) {
@@ -363,7 +363,7 @@ impl CellTracingService {
     /// // Now tracing is properly configured
     /// tracing::info!("cell started");
     /// ```
-    pub async fn start(&self, handle: ConnectionHandle) {
+    pub async fn start<C: Caller>(&self, handle: C) {
         self.start_with_options(handle, 64, Duration::from_millis(50))
             .await;
     }
@@ -371,9 +371,9 @@ impl CellTracingService {
     /// Start with custom batch size and flush interval.
     ///
     /// See [`start`](Self::start) for details.
-    pub async fn start_with_options(
+    pub async fn start_with_options<C: Caller>(
         &self,
-        handle: ConnectionHandle,
+        handle: C,
         batch_size: usize,
         flush_interval: Duration,
     ) {
@@ -420,7 +420,7 @@ impl CellTracingService {
         since = "0.7.0",
         note = "use `start()` instead which queries config first"
     )]
-    pub fn spawn_drain(&self, handle: ConnectionHandle) {
+    pub fn spawn_drain<C: Caller>(&self, handle: C) {
         let buffer = self.buffer.clone();
         let filter = self.filter.clone();
 

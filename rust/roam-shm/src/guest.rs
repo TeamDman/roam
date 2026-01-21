@@ -7,6 +7,7 @@
 use std::io;
 use std::path::Path;
 use std::ptr;
+use std::sync::Arc;
 
 use roam_frame::{Frame, INLINE_PAYLOAD_LEN, INLINE_PAYLOAD_SLOT, MsgDesc, Payload};
 use shm_primitives::{HeapRegion, MmapRegion, Region, SlotHandle};
@@ -14,11 +15,12 @@ use shm_primitives::{HeapRegion, MmapRegion, Region, SlotHandle};
 use crate::channel::ChannelEntry;
 use crate::layout::{
     CHANNEL_ENTRY_SIZE, DESC_SIZE, HEADER_SIZE, MAGIC, SegmentConfig, SegmentHeader, SegmentLayout,
-    VERSION,
+    SizeClass, VERSION,
 };
 use crate::peer::{PeerEntry, PeerId};
 use crate::slot_pool::SlotPool;
 use crate::spawn::SpawnArgs;
+use crate::var_slot_pool::VarSlotPool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecvError {
@@ -58,8 +60,10 @@ pub struct ShmGuest {
     peer_id: PeerId,
     /// Computed layout (reconstructed from header)
     layout: SegmentLayout,
-    /// Our slot pool
+    /// Our fixed-size slot pool (for message payloads)
     slots: SlotPool,
+    /// Shared variable-size slot pool (optional, for ShmBytes)
+    var_slot_pool: Option<Arc<VarSlotPool>>,
     /// Local tail for our G→H ring (what we've published)
     g2h_local_head: u64,
     /// Local head for our H→G ring (what we've consumed)
@@ -83,8 +87,6 @@ pub enum AttachError {
     SlotNotReserved,
     /// Peer ID is out of range for this segment
     InvalidPeerId,
-    /// Segment uses variable-size slot pools which this guest doesn't support
-    VarSlotPoolNotSupported,
     /// I/O error
     Io(io::Error),
 }
@@ -98,9 +100,6 @@ impl std::fmt::Display for AttachError {
             AttachError::HostGoodbye => write!(f, "host has signaled goodbye"),
             AttachError::SlotNotReserved => write!(f, "slot was not reserved for this guest"),
             AttachError::InvalidPeerId => write!(f, "peer ID is out of range for this segment"),
-            AttachError::VarSlotPoolNotSupported => {
-                write!(f, "segment uses variable-size slot pools (not supported)")
-            }
             AttachError::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -144,27 +143,40 @@ impl ShmGuest {
         let region = backing.region();
 
         // Validate header
-        let header = unsafe { &*(region.as_ptr() as *const crate::layout::SegmentHeader) };
+        let header = unsafe { &*(region.as_ptr() as *const SegmentHeader) };
 
-        if header.magic != crate::layout::MAGIC {
+        if header.magic != MAGIC {
             return Err(AttachError::InvalidMagic);
         }
-        if header.version != crate::layout::VERSION
-            || header.header_size != crate::layout::HEADER_SIZE as u32
-        {
+        if header.version != VERSION || header.header_size != HEADER_SIZE as u32 {
             return Err(AttachError::UnsupportedVersion);
         }
         if header.is_host_goodbye() {
             return Err(AttachError::HostGoodbye);
         }
 
-        // Check if this segment uses variable-size slot pools
-        if header.var_slot_pool_offset != 0 {
-            return Err(AttachError::VarSlotPoolNotSupported);
-        }
+        // Determine if var_slot_pool is configured
+        let var_slot_classes = if header.var_slot_pool_offset != 0 {
+            // Read size classes from the var slot pool headers
+            let class_count = header.var_slot_class_count;
+            let mut classes = Vec::with_capacity(class_count as usize);
+            for i in 0..class_count as usize {
+                let header_offset = header.var_slot_pool_offset as usize + i * 64;
+                let class_header = unsafe {
+                    &*(region.offset(header_offset) as *const crate::var_slot_pool::SizeClassHeader)
+                };
+                classes.push(SizeClass {
+                    slot_size: class_header.slot_size,
+                    count: class_header.slots_per_extent,
+                });
+            }
+            Some(classes)
+        } else {
+            None
+        };
 
-        // Reconstruct layout from header (fixed-size per-guest pools only)
-        let config = crate::layout::SegmentConfig {
+        // Reconstruct layout from header
+        let config = SegmentConfig {
             max_payload_size: header.max_payload_size,
             initial_credit: header.initial_credit,
             max_guests: header.max_guests,
@@ -173,7 +185,7 @@ impl ShmGuest {
             slots_per_guest: header.slots_per_guest,
             max_channels: header.max_channels,
             heartbeat_interval: header.heartbeat_interval,
-            var_slot_classes: None,
+            var_slot_classes,
             file_cleanup: shm_primitives::FileCleanup::Auto,
         };
         let layout = config
@@ -195,17 +207,29 @@ impl ShmGuest {
             .try_claim_reserved()
             .map_err(|_| AttachError::SlotNotReserved)?;
 
+        // Always create fixed-size slot pool (for message payloads)
         let slots = SlotPool::new(
             region,
             layout.guest_slot_pool_offset(peer_id.get()),
             &config,
         );
 
+        // Optionally create var_slot_pool (for ShmBytes)
+        let var_slot_pool = if header.var_slot_pool_offset != 0 {
+            let var_pool = VarSlotPool::from_segment(
+                region,
+                header.var_slot_pool_offset,
+                header.var_slot_class_count,
+            );
+            Some(Arc::new(var_pool))
+        } else {
+            None
+        };
+
         // Initialize channel table entries to Free
         let channel_table_offset = layout.guest_channel_table_offset(peer_id.get());
         for i in 0..config.max_channels {
-            let entry_offset =
-                channel_table_offset as usize + i as usize * crate::layout::CHANNEL_ENTRY_SIZE;
+            let entry_offset = channel_table_offset as usize + i as usize * CHANNEL_ENTRY_SIZE;
             let channel_entry = unsafe { &mut *(region.offset(entry_offset) as *mut ChannelEntry) };
             channel_entry.init();
         }
@@ -216,6 +240,7 @@ impl ShmGuest {
             peer_id,
             layout,
             slots,
+            var_slot_pool,
             g2h_local_head: 0,
             h2g_local_tail: 0,
             fatal_error: false,
@@ -250,13 +275,28 @@ impl ShmGuest {
             return Err(AttachError::HostGoodbye);
         }
 
-        // Check if this segment uses variable-size slot pools
-        if header.var_slot_pool_offset != 0 {
-            return Err(AttachError::VarSlotPoolNotSupported);
-        }
+        // Determine if var_slot_pool is configured
+        let var_slot_classes = if header.var_slot_pool_offset != 0 {
+            // Read size classes from the var slot pool headers
+            let class_count = header.var_slot_class_count;
+            let mut classes = Vec::with_capacity(class_count as usize);
+            for i in 0..class_count as usize {
+                let header_offset = header.var_slot_pool_offset as usize + i * 64;
+                let class_header = unsafe {
+                    &*(region.offset(header_offset) as *const crate::var_slot_pool::SizeClassHeader)
+                };
+                classes.push(SizeClass {
+                    slot_size: class_header.slot_size,
+                    count: class_header.slots_per_extent,
+                });
+            }
+            Some(classes)
+        } else {
+            None
+        };
 
-        // Reconstruct layout from header (fixed-size per-guest pools only)
-        let config = crate::layout::SegmentConfig {
+        // Reconstruct layout from header
+        let config = SegmentConfig {
             max_payload_size: header.max_payload_size,
             initial_credit: header.initial_credit,
             max_guests: header.max_guests,
@@ -265,7 +305,7 @@ impl ShmGuest {
             slots_per_guest: header.slots_per_guest,
             max_channels: header.max_channels,
             heartbeat_interval: header.heartbeat_interval,
-            var_slot_classes: None,
+            var_slot_classes,
             file_cleanup: shm_primitives::FileCleanup::Auto,
         };
         let layout = config
@@ -291,11 +331,24 @@ impl ShmGuest {
 
         let peer_id = peer_id.ok_or(AttachError::NoPeerSlots)?;
 
+        // Always create fixed-size slot pool (for message payloads)
         let slots = SlotPool::new(
             region,
             layout.guest_slot_pool_offset(peer_id.get()),
             &config,
         );
+
+        // Optionally create var_slot_pool (for ShmBytes)
+        let var_slot_pool = if header.var_slot_pool_offset != 0 {
+            let var_pool = VarSlotPool::from_segment(
+                region,
+                header.var_slot_pool_offset,
+                header.var_slot_class_count,
+            );
+            Some(Arc::new(var_pool))
+        } else {
+            None
+        };
 
         // Initialize channel table entries to Free
         let channel_table_offset = layout.guest_channel_table_offset(peer_id.get());
@@ -311,6 +364,7 @@ impl ShmGuest {
             peer_id,
             layout,
             slots,
+            var_slot_pool,
             g2h_local_head: 0,
             h2g_local_tail: 0,
             fatal_error: false,
@@ -339,6 +393,14 @@ impl ShmGuest {
     #[inline]
     pub fn config(&self) -> &SegmentConfig {
         &self.layout.config
+    }
+
+    /// Get the shared variable-size slot pool (for ShmBytes support).
+    ///
+    /// Returns `None` if the segment wasn't configured with `var_slot_classes`.
+    #[inline]
+    pub fn var_slot_pool(&self) -> Option<Arc<VarSlotPool>> {
+        self.var_slot_pool.clone()
     }
 
     /// Get the segment header.

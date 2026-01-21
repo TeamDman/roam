@@ -77,6 +77,11 @@ pub struct ShmHost {
     pub(crate) host_slots: SlotPool,
     /// Host's local head for each guest's H→G ring
     host_to_guest_heads: HashMap<PeerId, u64>,
+    /// Shared variable-size slot pool (if configured).
+    ///
+    /// Used for `ShmBytes` zero-copy buffer passing. This is `Some` if
+    /// `config.var_slot_classes` was set when creating the segment.
+    var_slot_pool: Option<std::sync::Arc<VarSlotPool>>,
 }
 
 /// Host-side state for a single guest.
@@ -128,6 +133,9 @@ impl ShmHost {
 
         let host_slots = SlotPool::new(region, layout.host_slot_pool_offset(), &config);
 
+        // Create VarSlotPool if configured
+        let var_slot_pool = Self::create_var_slot_pool(&region, &layout);
+
         Ok(Self {
             backing: ShmBacking::Mmap(backing),
             path: Some(path.as_ref().to_path_buf()),
@@ -136,6 +144,7 @@ impl ShmHost {
             guests: HashMap::new(),
             host_slots,
             host_to_guest_heads: HashMap::new(),
+            var_slot_pool,
         })
     }
 
@@ -163,6 +172,9 @@ impl ShmHost {
 
         let host_slots = SlotPool::new(region, layout.host_slot_pool_offset(), &config);
 
+        // Create VarSlotPool if configured
+        let var_slot_pool = Self::create_var_slot_pool(&region, &layout);
+
         Ok(Self {
             backing: ShmBacking::Heap(backing),
             path: None,
@@ -171,7 +183,19 @@ impl ShmHost {
             guests: HashMap::new(),
             host_slots,
             host_to_guest_heads: HashMap::new(),
+            var_slot_pool,
         })
+    }
+
+    /// Create a VarSlotPool from the layout if variable-size slots are configured.
+    fn create_var_slot_pool(
+        region: &Region,
+        layout: &SegmentLayout,
+    ) -> Option<std::sync::Arc<VarSlotPool>> {
+        let var_classes = layout.config.var_slot_classes.as_ref()?;
+        let var_pool_offset = layout.var_slot_pool_offset?;
+        let var_pool = VarSlotPool::new(*region, var_pool_offset, var_classes.to_vec());
+        Some(std::sync::Arc::new(var_pool))
     }
 
     /// Get the path to the segment file, if any.
@@ -185,6 +209,14 @@ impl ShmHost {
     #[inline]
     pub fn config(&self) -> &SegmentConfig {
         &self.layout.config
+    }
+
+    /// Get the shared variable-size slot pool, if configured.
+    ///
+    /// This is used by the driver to set the `SHM_POOL` task-local for
+    /// `ShmBytes` allocation/access.
+    pub fn var_slot_pool(&self) -> Option<std::sync::Arc<VarSlotPool>> {
+        self.var_slot_pool.clone()
     }
 
     /// Add a new peer, returning the spawn ticket.
@@ -279,6 +311,12 @@ impl ShmHost {
         header.max_channels = layout.config.max_channels;
         header.heartbeat_interval = layout.config.heartbeat_interval;
         header.var_slot_pool_offset = layout.var_slot_pool_offset.unwrap_or(0);
+        header.var_slot_class_count = layout
+            .config
+            .var_slot_classes
+            .as_ref()
+            .map(|c| c.len() as u32)
+            .unwrap_or(0);
         header
             .current_size
             .store(layout.total_size, core::sync::atomic::Ordering::Release);
@@ -304,33 +342,33 @@ impl ShmHost {
         }
     }
 
-    /// Initialize all slot pools (host + per-guest or shared var pool).
+    /// Initialize all slot pools (host + per-guest fixed pools, and optionally var_slot_pool).
     ///
     /// # Safety
     ///
     /// The region must be valid and exclusively owned.
     unsafe fn init_slot_pools(region: &Region, layout: &SegmentLayout) {
+        // Always initialize fixed-size per-guest pools (for message payloads)
+        // Host pool
+        unsafe { SlotPool::init(region, layout.host_slot_pool_offset(), &layout.config) };
+
+        // Guest pools
+        for i in 0..layout.config.max_guests {
+            let peer_id = PeerId::from_index(i as u8).unwrap();
+            unsafe {
+                SlotPool::init(
+                    region,
+                    layout.guest_slot_pool_offset(peer_id.get()),
+                    &layout.config,
+                )
+            };
+        }
+
+        // Optionally initialize shared variable-size slot pool (for ShmBytes)
         if let Some(ref var_classes) = layout.config.var_slot_classes {
-            // Initialize shared variable-size slot pool
             let var_pool_offset = layout.var_slot_pool_offset.unwrap();
             let mut var_pool = VarSlotPool::new(*region, var_pool_offset, var_classes.to_vec());
             unsafe { var_pool.init() };
-        } else {
-            // Initialize fixed-size per-guest pools
-            // Host pool
-            unsafe { SlotPool::init(region, layout.host_slot_pool_offset(), &layout.config) };
-
-            // Guest pools
-            for i in 0..layout.config.max_guests {
-                let peer_id = PeerId::from_index(i as u8).unwrap();
-                unsafe {
-                    SlotPool::init(
-                        region,
-                        layout.guest_slot_pool_offset(peer_id.get()),
-                        &layout.config,
-                    )
-                };
-            }
         }
     }
 

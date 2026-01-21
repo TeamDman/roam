@@ -432,49 +432,58 @@ where
     C: MessageConnector,
     D: ServiceDispatcher + Clone + 'static,
 {
-    async fn call<T: Facet<'static>>(
+    fn call<T: Facet<'static> + Send>(
         &self,
         method_id: u64,
         args: &mut T,
-    ) -> Result<ResponseData, TransportError> {
-        let mut attempt = 0u32;
+    ) -> impl std::future::Future<Output = Result<ResponseData, TransportError>> + Send {
+        // Clone self and serialize args before the async block
+        let this = self.clone();
+        // Bind streams and serialize synchronously
+        let channels = crate::collect_channel_ids(args);
+        let payload_result = facet_postcard::to_vec(args);
+        
+        async move {
+            let payload = payload_result.map_err(TransportError::Encode)?;
+            let mut attempt = 0u32;
 
-        loop {
-            let handle = match self.ensure_connected().await {
-                Ok(h) => h,
-                Err(ConnectError::ConnectFailed(_)) => {
-                    attempt += 1;
-                    if attempt >= self.retry_policy.max_attempts {
+            loop {
+                let handle = match this.ensure_connected().await {
+                    Ok(h) => h,
+                    Err(ConnectError::ConnectFailed(_)) => {
+                        attempt += 1;
+                        if attempt >= this.retry_policy.max_attempts {
+                            return Err(TransportError::ConnectionClosed);
+                        }
+                        let backoff = this.retry_policy.backoff_for_attempt(attempt);
+                        sleep(backoff).await;
+                        continue;
+                    }
+                    Err(ConnectError::RetriesExhausted { .. }) => {
                         return Err(TransportError::ConnectionClosed);
                     }
-                    let backoff = self.retry_policy.backoff_for_attempt(attempt);
-                    sleep(backoff).await;
-                    continue;
-                }
-                Err(ConnectError::RetriesExhausted { .. }) => {
-                    return Err(TransportError::ConnectionClosed);
-                }
-                Err(ConnectError::Rpc(e)) => return Err(e),
-            };
+                    Err(ConnectError::Rpc(e)) => return Err(e),
+                };
 
-            match handle.call(method_id, args).await {
-                Ok(response) => return Ok(response),
-                Err(TransportError::Encode(e)) => {
-                    return Err(TransportError::Encode(e));
-                }
-                Err(TransportError::ConnectionClosed) | Err(TransportError::DriverGone) => {
-                    {
-                        let mut state = self.state.lock().await;
-                        *state = None;
+                match handle.call_raw_with_channels(method_id, channels.clone(), payload.clone(), None).await {
+                    Ok(response) => return Ok(response),
+                    Err(TransportError::Encode(e)) => {
+                        return Err(TransportError::Encode(e));
                     }
+                    Err(TransportError::ConnectionClosed) | Err(TransportError::DriverGone) => {
+                        {
+                            let mut state = this.state.lock().await;
+                            *state = None;
+                        }
 
-                    attempt += 1;
-                    if attempt >= self.retry_policy.max_attempts {
-                        return Err(TransportError::ConnectionClosed);
+                        attempt += 1;
+                        if attempt >= this.retry_policy.max_attempts {
+                            return Err(TransportError::ConnectionClosed);
+                        }
+
+                        let backoff = this.retry_policy.backoff_for_attempt(attempt);
+                        sleep(backoff).await;
                     }
-
-                    let backoff = self.retry_policy.backoff_for_attempt(attempt);
-                    sleep(backoff).await;
                 }
             }
         }

@@ -175,8 +175,13 @@ pub struct SegmentHeader {
     ///
     /// shm[impl shm.varslot.extents]
     pub current_size: AtomicU64,
+    /// Number of size classes in the variable-size slot pool.
+    ///
+    /// When `var_slot_pool_offset != 0`, this indicates how many size class
+    /// headers are at that offset. Guests use this to reconstruct the pool.
+    pub var_slot_class_count: u32,
     /// Reserved for future use (zero)
-    pub reserved: [u8; 32],
+    pub reserved: [u8; 28],
 }
 
 const _: () = assert!(size_of::<SegmentHeader>() == HEADER_SIZE);
@@ -394,36 +399,41 @@ impl SegmentLayout {
         // Slot region follows peer table
         let slot_region_offset = align_up(peer_table_offset + peer_table_size, 64);
 
-        // Compute layout based on pool type
-        let (pool_size, var_slot_pool_offset, var_slot_pool_size, slot_region_size) =
-            if let Some(ref classes) = config.var_slot_classes {
-                // Variable-size shared pool
-                // shm[impl shm.varslot.shared]
-                let var_pool_size = crate::var_slot_pool::VarSlotPool::calculate_size(classes);
-                (0, Some(slot_region_offset), var_pool_size, var_pool_size)
-            } else {
-                // Fixed-size per-guest pools
-                // Compute slot pool size per shm-spec:
-                // pool_size = slot_pool_header_size + slots_per_guest * slot_size
-                // where slot_pool_header_size is a bitmap header rounded up to 64 bytes.
-                //
-                // shm[impl shm.segment.pool-size]
-                // shm[impl shm.slot.pool-header-size]
-                let bitmap_words = (config.slots_per_guest as u64).div_ceil(64);
-                let bitmap_bytes = bitmap_words * 8;
-                let slot_pool_header_size = align_up(bitmap_bytes, 64);
-                let pool_size = slot_pool_header_size
-                    + (config.slots_per_guest as u64) * config.slot_size as u64;
+        // Fixed-size per-guest pools (always present)
+        // Compute slot pool size per shm-spec:
+        // pool_size = slot_pool_header_size + slots_per_guest * slot_size
+        // where slot_pool_header_size is a bitmap header rounded up to 64 bytes.
+        //
+        // shm[impl shm.segment.pool-size]
+        // shm[impl shm.slot.pool-header-size]
+        let bitmap_words = (config.slots_per_guest as u64).div_ceil(64);
+        let bitmap_bytes = bitmap_words * 8;
+        let slot_pool_header_size = align_up(bitmap_bytes, 64);
+        let pool_size =
+            slot_pool_header_size + (config.slots_per_guest as u64) * config.slot_size as u64;
 
-                // Slot region contains:
-                // - Host slot pool (position 0)
-                // - One slot pool per potential guest (positions 1..=max_guests)
-                //
-                // shm[impl shm.segment.host-slots]
-                // shm[impl shm.segment.guest-slot-offset]
-                let slot_region_size = (config.max_guests as u64 + 1) * pool_size;
-                (pool_size, None, 0, slot_region_size)
+        // Slot region contains:
+        // - Host slot pool (position 0)
+        // - One slot pool per potential guest (positions 1..=max_guests)
+        //
+        // shm[impl shm.segment.host-slots]
+        // shm[impl shm.segment.guest-slot-offset]
+        let fixed_pools_size = (config.max_guests as u64 + 1) * pool_size;
+
+        // Variable-size shared pool (optional, for ShmBytes)
+        // Placed after fixed pools when configured.
+        //
+        // shm[impl shm.varslot.shared]
+        let (var_slot_pool_offset, var_slot_pool_size) =
+            if let Some(ref classes) = config.var_slot_classes {
+                let offset = align_up(slot_region_offset + fixed_pools_size, 64);
+                let size = crate::var_slot_pool::VarSlotPool::calculate_size(classes);
+                (Some(offset), size)
+            } else {
+                (None, 0)
             };
+
+        let slot_region_size = fixed_pools_size + align_up(var_slot_pool_size, 64);
 
         // Guest areas follow slot region
         let guest_areas_offset = align_up(slot_region_offset + slot_region_size, 64);

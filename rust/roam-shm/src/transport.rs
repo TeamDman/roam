@@ -377,6 +377,18 @@ impl ShmGuestTransport {
         self.guest.config()
     }
 
+    /// Get the shared variable-size slot pool (for ShmBytes support).
+    ///
+    /// Returns `None` if the segment wasn't configured with `var_slot_classes`.
+    pub fn var_slot_pool(&self) -> Option<std::sync::Arc<crate::var_slot_pool::VarSlotPool>> {
+        self.guest.var_slot_pool()
+    }
+
+    /// Get the peer ID for this guest (1-255).
+    pub fn peer_id(&self) -> crate::peer::PeerId {
+        self.guest.peer_id()
+    }
+
     /// Send a message (async with backpressure).
     ///
     /// If slots are exhausted, waits for the doorbell (host signals when slots are freed)

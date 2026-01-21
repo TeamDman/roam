@@ -20,6 +20,7 @@ pub use driver::{
 };
 pub use transport::MessageTransport;
 
+use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -658,6 +659,41 @@ roam_task_local::task_local! {
     /// is critical: thread_local can leak across different async tasks that
     /// happen to run on the same worker thread, causing channel binding bugs.
     static DISPATCH_CONTEXT: DispatchContext;
+}
+
+// ============================================================================
+// Post-Deserialization Patch Hook (for transport-specific patching)
+// ============================================================================
+
+/// A function that patches deserialized data using facet reflection.
+///
+/// This hook is called inside the async dispatch context (after task-locals
+/// like `SHM_POOL` are set) but before the handler is invoked. Transports
+/// can use this to fill in data that requires transport-specific context.
+///
+/// For example, `ShmBytes` needs the `SHM_POOL` task-local to look up
+/// buffer lengths from slot metadata.
+pub type PatchHook = fn(poke: facet::Poke<'_, '_>);
+
+roam_task_local::task_local! {
+    /// Task-local hook for post-deserialization patching.
+    ///
+    /// Set by transports (e.g., SHM) that need to patch deserialized data
+    /// within their task-local context. Called inside `dispatch_call` after
+    /// the future is polled (when transport task-locals are available).
+    pub static PATCH_HOOK: PatchHook;
+}
+
+/// Call the patch hook on the given data, if one is set.
+///
+/// This is called inside `dispatch_call` after transport task-locals are
+/// available but before the handler is invoked. Transports may also call
+/// this from their `Caller::patch_response` implementation.
+pub fn call_patch_hook<T: Facet<'static>>(data: &mut T) {
+    let _ = PATCH_HOOK.try_with(|hook| {
+        let poke = facet::Poke::new(data);
+        hook(poke);
+    });
 }
 
 /// Get the current dispatch context, if any.
@@ -1306,6 +1342,11 @@ where
     // This is critical: unlike thread_local, task_local won't leak to other
     // tasks that happen to run on the same worker thread.
     Box::pin(DISPATCH_CONTEXT.scope(dispatch_ctx, async move {
+        // Call transport-specific patch hook (e.g., for ShmBytes length patching).
+        // This runs inside the async block where transport task-locals are set.
+        let mut args = args;
+        call_patch_hook(&mut args);
+
         debug!("dispatch_call: handler ASYNC starting");
         let result = handler(args).await;
         debug!("dispatch_call: handler ASYNC finished");
@@ -1389,6 +1430,11 @@ where
 
     // Use task_local scope so roam::channel() creates bound channels.
     Box::pin(DISPATCH_CONTEXT.scope(dispatch_ctx, async move {
+        // Call transport-specific patch hook (e.g., for ShmBytes length patching).
+        // This runs inside the async block where transport task-locals are set.
+        let mut args = args;
+        call_patch_hook(&mut args);
+
         let result = handler(args).await;
 
         // Collect channel IDs from the result (e.g., Rx<T> in return type)
@@ -1565,6 +1611,8 @@ fn patch_channel_ids_recursive(mut poke: facet::Poke<'_, '_>, channels: &[u64], 
 
         // Recurse into list elements (e.g., Vec<Tx<T>>)
         Def::List(list_def) => {
+            // Get the container's shape (e.g., Vec<Tx<T>>) - needed for get_mut vtable
+            let container_shape = poke.shape();
             let len = {
                 let peek = poke.as_peek();
                 peek.into_list().map(|pl| pl.len()).unwrap_or(0)
@@ -1575,7 +1623,9 @@ fn patch_channel_ids_recursive(mut poke: facet::Poke<'_, '_>, channels: &[u64], 
                 let data_ptr = poke.data_mut();
                 for i in 0..len {
                     // SAFETY: We have exclusive mutable access via poke, index < len, shape is correct
-                    let element_ptr = unsafe { (get_mut_fn)(data_ptr, i, element_shape) };
+                    // Note: Pass container_shape (Vec<T>), not element_shape (T)
+                    // The vtable uses shape.type_params[0] to get element size
+                    let element_ptr = unsafe { (get_mut_fn)(data_ptr, i, container_shape) };
                     if let Some(ptr) = element_ptr {
                         // SAFETY: ptr points to a valid element with the correct shape
                         let element_poke =
@@ -2166,6 +2216,9 @@ impl<E> From<DecodeError> for CallError<E> {
 /// This is the core response decoding logic used by generated clients.
 /// It handles the wire format: `[0] + value_bytes` for Ok, `[1, discriminant] + error_bytes` for Err.
 ///
+/// Note: This performs raw deserialization only. The caller should use
+/// `Caller::patch_response` afterward to patch transport-specific types.
+///
 /// Returns `Result<T, CallError<E>>` with the decoded value or error.
 pub fn decode_response<T: Facet<'static>, E: Facet<'static>>(
     payload: &[u8],
@@ -2177,7 +2230,8 @@ pub fn decode_response<T: Facet<'static>, E: Facet<'static>>(
     match payload[0] {
         0 => {
             // Ok variant: deserialize the value
-            facet_postcard::from_slice(&payload[1..]).map_err(CallError::Decode)
+            let value: T = facet_postcard::from_slice(&payload[1..]).map_err(CallError::Decode)?;
+            Ok(value)
         }
         1 => {
             // Err variant: deserialize RoamError<E>
@@ -2210,7 +2264,9 @@ pub fn decode_response<T: Facet<'static>, E: Facet<'static>>(
 /// All callers return `TransportError` for transport-level failures.
 /// Generated clients convert this to `CallError<E>` which also includes
 /// response-level errors like `RoamError::User(E)`.
-#[allow(async_fn_in_trait)]
+///
+/// The `call` method returns a `Send` future, allowing callers to be used
+/// in spawned tasks.
 pub trait Caller: Clone + Send + Sync + 'static {
     /// Make an RPC call with the given method ID and arguments.
     ///
@@ -2218,11 +2274,11 @@ pub trait Caller: Clone + Send + Sync + 'static {
     /// assigned channel IDs before serialization.
     ///
     /// Returns ResponseData containing the payload and any response channel IDs.
-    async fn call<T: Facet<'static>>(
+    fn call<T: Facet<'static> + Send>(
         &self,
         method_id: u64,
         args: &mut T,
-    ) -> Result<ResponseData, TransportError>;
+    ) -> impl Future<Output = Result<ResponseData, TransportError>> + Send;
 
     /// Bind receivers for Rx<T> streams in the response.
     ///
@@ -2231,15 +2287,28 @@ pub trait Caller: Clone + Send + Sync + 'static {
     /// response and binds receivers for each Rx using the channel IDs from
     /// the Response message.
     fn bind_response_streams<T: Facet<'static>>(&self, response: &mut T, channels: &[u64]);
+
+    /// Patch transport-specific types in a deserialized response.
+    ///
+    /// Called after response deserialization to allow transports to fix up
+    /// types like `ShmBytes` (patch lengths, claim ownership, etc.).
+    ///
+    /// The default implementation calls `call_patch_hook` which uses the
+    /// `PATCH_HOOK` task-local. Transports that need custom patching logic
+    /// (like SHM) can override this to set up the appropriate context.
+    fn patch_response<T: Facet<'static>>(&self, response: &mut T) {
+        call_patch_hook(response);
+    }
 }
 
 impl Caller for ConnectionHandle {
-    async fn call<T: Facet<'static>>(
+    fn call<T: Facet<'static> + Send>(
         &self,
         method_id: u64,
         args: &mut T,
-    ) -> Result<ResponseData, TransportError> {
-        ConnectionHandle::call(self, method_id, args).await
+    ) -> impl Future<Output = Result<ResponseData, TransportError>> + Send {
+        // Delegate to the inherent async method
+        ConnectionHandle::call(self, method_id, args)
     }
 
     fn bind_response_streams<T: Facet<'static>>(&self, response: &mut T, channels: &[u64]) {
@@ -2591,8 +2660,9 @@ impl ConnectionHandle {
     /// Make a raw RPC call with pre-serialized payload and channel IDs.
     ///
     /// Used internally by `call()` after binding streams.
+    /// Also used by reconnecting clients that serialize early to avoid Send issues.
     /// Returns ResponseData so caller can handle response channels.
-    async fn call_raw_with_channels(
+    pub async fn call_raw_with_channels(
         &self,
         method_id: u64,
         channels: Vec<u64>,

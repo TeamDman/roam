@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roam::session::RoutedDispatcher;
-use roam_shm::driver::{establish_guest, establish_multi_peer_host};
+use roam_shm::driver::{establish_guest, establish_multi_peer_host, ShmConnectionHandle};
 use roam_shm::host::ShmHost;
 use roam_shm::layout::SegmentConfig;
 use roam_shm::transport::ShmGuestTransport;
@@ -51,8 +51,8 @@ impl HostService for HostServiceImpl {
 }
 
 struct TracingTestFixture {
-    guest_handle: roam_session::ConnectionHandle,
-    host_handle: roam_session::ConnectionHandle,
+    guest_handle: ShmConnectionHandle,
+    host_handle: ShmConnectionHandle,
     tracing_state: Arc<HostTracingState>,
     tracing_guard: CellTracingGuard,
     _dir: tempfile::TempDir,
@@ -70,6 +70,7 @@ fn setup_tracing_test() -> TracingTestFixture {
         .add_peer(roam_shm::spawn::AddPeerOptions {
             peer_name: Some("tracing-guest".to_string()),
             on_death: None,
+            ..Default::default()
         })
         .unwrap();
 

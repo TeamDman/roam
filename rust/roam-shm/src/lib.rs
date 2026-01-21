@@ -69,6 +69,7 @@ pub mod channel;
 pub mod layout;
 pub mod msg;
 pub mod peer;
+pub mod shm_bytes;
 pub(crate) mod slot_pool;
 pub mod var_slot_pool;
 
@@ -91,6 +92,7 @@ pub use layout::{
 };
 pub use msg::msg_type;
 pub use peer::{PeerEntry, PeerId, PeerState};
+pub use shm_bytes::{ShmBytes, ShmError, SHM_LOCAL_PEER_ID, SHM_POOL, patch_shm_bytes, patch_shm_bytes_hook};
 pub use var_slot_pool::{SizeClassHeader, VarFreeError, VarSlotHandle, VarSlotPool};
 
 // Re-export MsgDesc from roam-frame

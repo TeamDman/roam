@@ -104,7 +104,9 @@ impl SizeClassHeader {
 /// Handle to an allocated variable-size slot.
 ///
 /// Encodes the size class index, extent index, slot index, and generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// This type implements `Facet` so it can serve as the wire proxy for `ShmBytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, facet::Facet)]
 pub struct VarSlotHandle {
     /// Size class index (0-255).
     pub class_idx: u8,
@@ -225,6 +227,32 @@ impl VarSlotPool {
         }
     }
 
+    /// Create a VarSlotPool by reading size class headers from an existing segment.
+    ///
+    /// This is used by guests to attach to a host-created pool. The size class
+    /// information is read from the `SizeClassHeader` structures at `base_offset`.
+    ///
+    /// # Arguments
+    ///
+    /// * `region` - The shared memory region
+    /// * `base_offset` - Offset to the var slot pool (from segment header)
+    /// * `class_count` - Number of size classes (from segment header)
+    pub fn from_segment(region: Region, base_offset: u64, class_count: u32) -> Self {
+        // Read size class info from the headers
+        let mut classes = Vec::with_capacity(class_count as usize);
+        for i in 0..class_count as usize {
+            let header_offset = base_offset as usize + i * 64;
+            let header = unsafe { &*(region.offset(header_offset) as *const SizeClassHeader) };
+            classes.push(SizeClass {
+                slot_size: header.slot_size,
+                count: header.slots_per_extent,
+            });
+        }
+
+        // Now construct the pool with the read configuration
+        Self::new(region, base_offset, classes)
+    }
+
     /// Update the region after a resize/remap.
     ///
     /// Call this after the underlying MmapRegion has been resized.
@@ -341,7 +369,9 @@ impl VarSlotPool {
     }
 
     /// Get a slot's metadata for any extent.
-    fn slot_meta_ext(
+    ///
+    /// This is crate-public for testing and internal use.
+    pub(crate) fn slot_meta_ext(
         &self,
         class_idx: usize,
         extent_idx: usize,
@@ -571,6 +601,58 @@ impl VarSlotPool {
             Ok(_) => Ok(()),
             Err(actual) => Err(VarFreeError::InvalidState {
                 expected: SlotState::Allocated,
+                actual: SlotState::from_u32(actual).unwrap_or(SlotState::Free),
+            }),
+        }
+    }
+
+    /// Free an in-flight slot back to its pool.
+    /// Claim an in-flight slot, becoming its new owner.
+    ///
+    /// This transitions `InFlight -> Allocated` and updates the owner.
+    /// Called by the receiver after deserializing an `ShmBytes` handle.
+    ///
+    /// shm[impl shm.varslot.claim]
+    pub fn claim_in_flight(&self, handle: VarSlotHandle, new_owner: u8) -> Result<(), VarFreeError> {
+        if handle.class_idx as usize >= self.classes.len() {
+            return Err(VarFreeError::InvalidClass);
+        }
+        let class = &self.classes[handle.class_idx as usize];
+        if handle.slot_idx >= class.count {
+            return Err(VarFreeError::InvalidIndex);
+        }
+
+        let meta = self
+            .slot_meta_ext(
+                handle.class_idx as usize,
+                handle.extent_idx as usize,
+                handle.slot_idx,
+            )
+            .ok_or(VarFreeError::InvalidIndex)?;
+
+        // Verify generation
+        let actual_gen = meta.generation.load(Ordering::Acquire);
+        if actual_gen != handle.generation {
+            return Err(VarFreeError::GenerationMismatch {
+                expected: handle.generation,
+                actual: actual_gen,
+            });
+        }
+
+        // Transition InFlight -> Allocated
+        match meta.state.compare_exchange(
+            SlotState::InFlight as u32,
+            SlotState::Allocated as u32,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Update owner
+                meta.owner_peer.store(new_owner as u32, Ordering::Release);
+                Ok(())
+            }
+            Err(actual) => Err(VarFreeError::InvalidState {
+                expected: SlotState::InFlight,
                 actual: SlotState::from_u32(actual).unwrap_or(SlotState::Free),
             }),
         }
@@ -1019,5 +1101,72 @@ mod tests {
             generation: 0,
         };
         assert!(pool.payload_ptr(invalid).is_none());
+    }
+
+    #[test]
+    fn test_claim_in_flight() {
+        let (_region, pool) = create_test_pool();
+
+        // Allocate a slot as peer 1
+        let handle = pool.alloc(32, 1).unwrap();
+
+        // Verify initial owner
+        let meta = pool
+            .slot_meta_ext(handle.class_idx as usize, handle.extent_idx as usize, handle.slot_idx)
+            .expect("meta should exist");
+        assert_eq!(meta.owner(), 1);
+        assert_eq!(meta.state(), SlotState::Allocated);
+
+        // Mark as in-flight (sender is about to send)
+        pool.mark_in_flight(handle).unwrap();
+        assert_eq!(meta.state(), SlotState::InFlight);
+        assert_eq!(meta.owner(), 1); // Owner unchanged during flight
+
+        // Claim as new owner (peer 2 receives)
+        pool.claim_in_flight(handle, 2).unwrap();
+        assert_eq!(meta.state(), SlotState::Allocated);
+        assert_eq!(meta.owner(), 2); // Owner changed to receiver
+
+        // Should be able to free as the new owner
+        pool.free_allocated(handle).unwrap();
+        assert_eq!(meta.state(), SlotState::Free);
+    }
+
+    #[test]
+    fn test_claim_wrong_state() {
+        let (_region, pool) = create_test_pool();
+
+        // Allocate a slot
+        let handle = pool.alloc(32, 1).unwrap();
+
+        // Try to claim without marking in-flight first - should fail
+        let result = pool.claim_in_flight(handle, 2);
+        assert!(matches!(
+            result,
+            Err(VarFreeError::InvalidState {
+                expected: SlotState::InFlight,
+                actual: SlotState::Allocated,
+            })
+        ));
+    }
+
+    #[test]
+    fn test_claim_stale_generation() {
+        let (_region, pool) = create_test_pool();
+
+        // Allocate, mark in-flight, free
+        let handle1 = pool.alloc(32, 1).unwrap();
+        pool.mark_in_flight(handle1).unwrap();
+        pool.free(handle1).unwrap();
+
+        // Reallocate same slot - gets new generation
+        let handle2 = pool.alloc(32, 1).unwrap();
+        assert_eq!(handle1.slot_idx, handle2.slot_idx); // Same slot
+        assert_ne!(handle1.generation, handle2.generation); // New generation
+
+        // Try to claim with old generation - should fail
+        pool.mark_in_flight(handle2).unwrap();
+        let result = pool.claim_in_flight(handle1, 2); // Using stale handle1
+        assert!(matches!(result, Err(VarFreeError::GenerationMismatch { .. })));
     }
 }

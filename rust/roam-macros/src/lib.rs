@@ -486,6 +486,8 @@ fn generate_client_method(
                 .await
                 .map_err(#roam::session::CallError::from)?;
             let mut result = #roam::session::decode_response::<#ok_ty, #err_ty>(&response.payload)?;
+            // Patch transport-specific types (e.g., ShmBytes lengths) - must happen before pretty-printing
+            #roam::session::Caller::patch_response(&self.caller, &mut result);
             #roam::tracing::debug!(target: "roam::rpc", method = #method_name_str, result = %result.pretty_with(#roam::PrettyPrinter::new().with_colors(#roam::facet_pretty::ColorMode::Never).with_max_content_len(64)), "response");
             // Bind any Rx<T> streams in the response so data can be received
             #roam::session::Caller::bind_response_streams(&self.caller, &mut result, &response.channels);

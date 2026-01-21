@@ -234,7 +234,7 @@ All core ShmBytes functionality is implemented and tested:
 
 - **Pre-existing deadlock in slot exhaustion + streaming**: Tests `mixed_calls_with_slot_exhaustion` and `slot_exhaustion_should_not_corrupt_channel_state` are ignored due to a deadlock when slots are exhausted while guest handlers await streaming data. Not related to ShmBytes work.
 - **facet_pretty triggers proxy conversion**: Debug logging of ShmBytes on client side calls `mark_in_flight()` where SHM_POOL isn't set. Currently just logs a warning. The warning is harmless - the slot is already InFlight at this point.
-- Some tests are verbose, so to avoid wasting tokens please always use a filter. Example: `| Select-String -Pattern "(FAILED|PASSED|error|^test result|running \d+ test)"`. Running build is fine, it's just the tracing feature that causes verbose test output when the test actually runs.
+- Some tests are verbose, so to avoid wasting tokens please always use a filter when running tests with tracing feature enabled. Example: `| Select-String -Pattern "(FAILED|PASSED|error|^test result|running \d+ test)"`. You do not need to filter the output of `cargo build`.
 - **Tracing tests can be flaky** when run in parallel - use `--test-threads=1` if needed.
 
 ## Additional reading: 

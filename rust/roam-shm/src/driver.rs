@@ -321,7 +321,6 @@ pub type IncomingConnections = mpsc::Receiver<IncomingConnection>;
 // ShmDriver - Single-peer driver (guest side)
 // ============================================================================
 
->>>>>>> upstream/main
 /// The SHM connection driver - a future that handles bidirectional RPC.
 ///
 /// This must be spawned or awaited to drive the connection forward.
@@ -968,7 +967,6 @@ where
         }
         // If request not found, it already completed - nothing to do
 
->>>>>>> upstream/main
         Ok(())
     }
 
@@ -1484,7 +1482,6 @@ impl MultiPeerHostDriverBuilder {
 
         let mut peers = HashMap::new();
         let mut handles = HashMap::new();
-        let mut incoming_connections_map = HashMap::new();
         let mut doorbells = HashMap::new();
 
         // Create ring channel for doorbell notifications (bounded, auditable)
@@ -1638,7 +1635,7 @@ impl MultiPeerHostDriverBuilder {
 
         let driver_handle = MultiPeerHostDriverHandle { control_tx };
 
-        (driver, handles, incoming_connections_map, driver_handle)
+        (driver, handles, driver_handle)
     }
 }
 
@@ -2514,7 +2511,6 @@ impl MultiPeerHostDriver {
         }
         // If request not found, it already completed - nothing to do
 
->>>>>>> upstream/main
         Ok(())
     }
 

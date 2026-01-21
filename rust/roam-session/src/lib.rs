@@ -20,7 +20,6 @@ pub use driver::{
 };
 pub use transport::MessageTransport;
 
-use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

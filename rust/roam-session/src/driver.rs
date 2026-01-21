@@ -474,42 +474,29 @@ where
     ) -> Result<ResponseData, TransportError> {
         let mut attempt = 0u32;
 
-            loop {
-                let handle = match self.ensure_connected().await {
-                    Ok(h) => h,
-                    Err(ConnectError::ConnectFailed(_)) => {
-                        attempt += 1;
-                        if attempt >= self.retry_policy.max_attempts {
-                            return Err(TransportError::ConnectionClosed);
-                        }
-                        let backoff = self.retry_policy.backoff_for_attempt(attempt);
-                        sleep(backoff).await;
-                        continue;
-                    }
-                    Err(ConnectError::RetriesExhausted { .. }) => {
+        loop {
+            let handle = match self.ensure_connected().await {
+                Ok(h) => h,
+                Err(ConnectError::ConnectFailed(_)) => {
+                    attempt += 1;
+                    if attempt >= self.retry_policy.max_attempts {
                         return Err(TransportError::ConnectionClosed);
                     }
-                    Err(ConnectError::Rpc(e)) => return Err(e),
-                    Err(ConnectError::Rejected(_)) => {
-                        // Virtual connection rejected - this shouldn't happen for link-level connect
-                        return Err(TransportError::ConnectionClosed);
-                    }
-                };
-
-                match handle.call_with_metadata(method_id, args, metadata.clone()).await {
-                    Ok(response) => return Ok(response),
-                    Err(TransportError::Encode(e)) => {
-                        return Err(TransportError::Encode(e));
+                    let backoff = self.retry_policy.backoff_for_attempt(attempt);
+                    sleep(backoff).await;
+                    continue;
+                }
+                Err(ConnectError::RetriesExhausted { .. }) => {
+                    return Err(TransportError::ConnectionClosed);
+                }
+                Err(ConnectError::Rpc(e)) => return Err(e),
                 Err(ConnectError::Rejected(_)) => {
                     // Virtual connection rejected - this shouldn't happen for link-level connect
                     return Err(TransportError::ConnectionClosed);
                 }
             };
 
-            match handle
-                .call_with_metadata(method_id, args, metadata.clone())
-                .await
-            {
+            match handle.call_with_metadata(method_id, args, metadata.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(TransportError::Encode(e)) => {
                     return Err(TransportError::Encode(e));
@@ -520,14 +507,13 @@ where
                         *state = None;
                     }
 
-                        attempt += 1;
-                        if attempt >= self.retry_policy.max_attempts {
-                            return Err(TransportError::ConnectionClosed);
-                        }
-
-                        let backoff = self.retry_policy.backoff_for_attempt(attempt);
-                        sleep(backoff).await;
+                    attempt += 1;
+                    if attempt >= self.retry_policy.max_attempts {
+                        return Err(TransportError::ConnectionClosed);
                     }
+
+                    let backoff = self.retry_policy.backoff_for_attempt(attempt);
+                    sleep(backoff).await;
                 }
             }
         }

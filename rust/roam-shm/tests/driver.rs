@@ -2147,12 +2147,6 @@ async fn shm_bytes_round_trip_processing() {
 
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 }
-=======
-//! Integration tests for the SHM driver.
-//!
-//! These tests verify that roam RPC services can run over SHM transport,
-//! including proper request/response handling and streaming.
-//!
 //! shm[verify shm.handshake]
 //! shm[verify shm.flow.no-credit-message]
 
@@ -4184,4 +4178,3 @@ async fn recursive_streaming_calls_with_slot_exhaustion() {
         "Host driver crashed - likely protocol violation"
     );
 }
->>>>>>> upstream/main

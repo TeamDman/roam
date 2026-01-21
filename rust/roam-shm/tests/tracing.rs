@@ -26,7 +26,7 @@ trait GuestService {
 struct GuestServiceImpl;
 
 impl GuestService for GuestServiceImpl {
-    async fn ping(&self) -> String {
+    async fn ping(&self, _cx: &roam::Context) -> String {
         // Emit a tracing event
         tracing::info!("guest received ping");
         "pong".to_string()
@@ -45,7 +45,7 @@ struct HostServiceImpl {
 }
 
 impl HostService for HostServiceImpl {
-    async fn get_name(&self) -> String {
+    async fn get_name(&self, _cx: &roam::Context) -> String {
         self.name.clone()
     }
 }
@@ -92,7 +92,8 @@ fn setup_tracing_test() -> TracingTestFixture {
 
     // Create guest transport
     let guest_transport = ShmGuestTransport::from_spawn_args(spawn_args).unwrap();
-    let (guest_handle, guest_driver) = establish_guest(guest_transport, guest_dispatcher);
+    let (guest_handle, _guest_incoming, guest_driver) =
+        establish_guest(guest_transport, guest_dispatcher);
 
     // === Host side setup ===
     // Create shared tracing state
@@ -108,7 +109,7 @@ fn setup_tracing_test() -> TracingTestFixture {
     let host_dispatcher = RoutedDispatcher::new(host_tracing_dispatcher, host_service_dispatcher);
 
     // Set up multi-peer host driver
-    let (host_driver, mut handles, _driver_handle) =
+    let (host_driver, mut handles, _host_incoming, _driver_handle) =
         establish_multi_peer_host(host, vec![(peer_id, host_dispatcher)]);
     let host_handle = handles.remove(&peer_id).unwrap();
 

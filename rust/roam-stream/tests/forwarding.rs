@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use roam_session::{
-    ChannelRegistry, ForwardingDispatcher, RoamError, Rx, ServiceDispatcher, Tx, channel,
+    ChannelRegistry, Context, ForwardingDispatcher, RoamError, Rx, ServiceDispatcher, Tx, channel,
     dispatch_call, dispatch_unknown_method,
 };
 use roam_stream::{Connector, HandshakeConfig, NoDispatcher, accept, connect};
@@ -49,29 +49,25 @@ impl ServiceDispatcher for StreamingService {
 
     fn dispatch(
         &self,
-        method_id: u64,
+        cx: &Context,
         payload: Vec<u8>,
-        channels: Vec<u64>,
-        request_id: u64,
         registry: &mut ChannelRegistry,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
 
-        match method_id {
+        match cx.method_id().raw() {
             // echo(message: String) -> String
             METHOD_ECHO => dispatch_call::<String, String, (), _, _>(
+                cx,
                 payload,
-                channels,
-                request_id,
                 registry,
                 |input: String| async move { Ok(input) },
             ),
 
             // sum(numbers: Rx<i32>) -> i64
             METHOD_SUM => dispatch_call::<Rx<i32>, i64, (), _, _>(
+                cx,
                 payload,
-                channels,
-                request_id,
                 registry,
                 |mut numbers: Rx<i32>| async move {
                     let mut total: i64 = 0;
@@ -84,9 +80,8 @@ impl ServiceDispatcher for StreamingService {
 
             // generate(count: u32, output: Tx<i32>)
             METHOD_GENERATE => dispatch_call::<(u32, Tx<i32>), (), (), _, _>(
+                cx,
                 payload,
-                channels,
-                request_id,
                 registry,
                 |(count, output): (u32, Tx<i32>)| async move {
                     for i in 0..count as i32 {
@@ -98,9 +93,8 @@ impl ServiceDispatcher for StreamingService {
 
             // transform(input: Rx<String>, output: Tx<String>)
             METHOD_TRANSFORM => dispatch_call::<(Rx<String>, Tx<String>), (), (), _, _>(
+                cx,
                 payload,
-                channels,
-                request_id,
                 registry,
                 |(mut input, output): (Rx<String>, Tx<String>)| async move {
                     while let Ok(Some(s)) = input.recv().await {
@@ -110,7 +104,7 @@ impl ServiceDispatcher for StreamingService {
                 },
             ),
 
-            _ => dispatch_unknown_method(request_id, registry),
+            _ => dispatch_unknown_method(cx, registry),
         }
     }
 }
@@ -141,7 +135,7 @@ async fn start_backend(service: StreamingService) -> (SocketAddr, tokio::task::J
         while let Ok((stream, _)) = listener.accept().await {
             let service = service.clone();
             tokio::spawn(async move {
-                if let Ok((handle, driver)) =
+                if let Ok((handle, _incoming, driver)) =
                     accept(stream, HandshakeConfig::default(), service).await
                 {
                     let _ = driver.run().await;
@@ -178,7 +172,7 @@ async fn start_proxy(backend_addr: SocketAddr) -> (SocketAddr, tokio::task::Join
                 let forwarder = ForwardingDispatcher::new(upstream_handle);
 
                 // Accept the client connection with forwarding
-                if let Ok((handle, driver)) =
+                if let Ok((handle, _incoming, driver)) =
                     accept(client_stream, HandshakeConfig::default(), forwarder).await
                 {
                     let _ = driver.run().await;

@@ -20,6 +20,9 @@ pub use roam_service_macros::service;
 // Re-export session types for macro-generated code
 pub use roam_session as session;
 
+// Re-export Context at top level for convenience
+pub use roam_session::Context;
+
 // Re-export streaming types for user-facing API
 pub use roam_session::{
     ChannelError, ChannelId, ChannelIdAllocator, ChannelRegistry, DriverMessage, ReceiverSlot,
@@ -39,6 +42,9 @@ pub use roam_schema as schema;
 
 // Re-export hash utilities
 pub use roam_hash as hash;
+
+// Re-export wire types for macro-generated code
+pub use roam_wire as wire;
 
 // Re-export facet for derive macros in service types
 pub use facet;

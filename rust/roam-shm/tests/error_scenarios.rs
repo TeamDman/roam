@@ -790,6 +790,7 @@ fn test_graceful_shutdown_no_death_callback() {
             on_death: Some(Arc::new(move |_| {
                 death_called_clone.store(true, Ordering::SeqCst);
             })),
+            ..Default::default()
         })
         .unwrap();
 

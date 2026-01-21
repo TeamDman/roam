@@ -14,9 +14,9 @@ pub mod runtime;
 pub mod transport;
 
 pub use driver::{
-    ConnectError, ConnectionError, Driver, FramedClient, HandshakeConfig, MessageConnector,
-    Negotiated, NoDispatcher, RetryPolicy, accept_framed, connect_framed,
-    connect_framed_with_policy, initiate_framed,
+    ConnectError, ConnectionError, Driver, FramedClient, HandshakeConfig, IncomingConnection,
+    IncomingConnections, MessageConnector, Negotiated, NoDispatcher, RetryPolicy, accept_framed,
+    connect_framed, connect_framed_with_policy, initiate_framed,
 };
 pub use transport::MessageTransport;
 
@@ -213,6 +213,8 @@ impl DriverTxSlot {
 #[derive(Facet)]
 #[facet(proxy = u64)]
 pub struct Tx<T: 'static> {
+    /// The connection ID this stream belongs to.
+    pub conn_id: roam_wire::ConnectionId,
     /// The unique stream ID for this stream.
     /// Public so Connection can poke it when binding streams.
     pub channel_id: ChannelId,
@@ -249,7 +251,9 @@ impl<T: 'static> TryFrom<u64> for Tx<T> {
     type Error = Infallible;
     fn try_from(channel_id: u64) -> Result<Self, Self::Error> {
         // Create a hollow Tx - no actual sender, Connection will bind later
+        // conn_id will be set when binding
         Ok(Tx {
+            conn_id: roam_wire::ConnectionId::ROOT,
             channel_id,
             sender: SenderSlot::empty(),
             driver_tx: DriverTxSlot::empty(),
@@ -262,6 +266,7 @@ impl<T: 'static> Tx<T> {
     /// Create a new Tx stream with the given ID and sender channel (client-side mode).
     pub fn new(channel_id: ChannelId, tx: Sender<Vec<u8>>) -> Self {
         Self {
+            conn_id: roam_wire::ConnectionId::ROOT,
             channel_id,
             sender: SenderSlot::new(tx),
             driver_tx: DriverTxSlot::empty(),
@@ -272,9 +277,10 @@ impl<T: 'static> Tx<T> {
     /// Create an unbound Tx with a sender but channel_id 0.
     ///
     /// Used by `roam::channel()` to create a pair before binding.
-    /// Connection will poke the channel_id when binding.
+    /// Connection will poke the channel_id and conn_id when binding.
     pub fn unbound(tx: Sender<Vec<u8>>) -> Self {
         Self {
+            conn_id: roam_wire::ConnectionId::ROOT,
             channel_id: 0,
             sender: SenderSlot::new(tx),
             driver_tx: DriverTxSlot::empty(),
@@ -282,12 +288,18 @@ impl<T: 'static> Tx<T> {
         }
     }
 
-    /// Create a bound Tx with channel_id and driver_tx already set.
+    /// Create a bound Tx with conn_id, channel_id and driver_tx already set.
     ///
     /// Used by `roam::channel()` when called during dispatch to create
     /// response channels that can send Data directly over the wire.
-    pub fn bound(channel_id: ChannelId, tx: Sender<Vec<u8>>, driver_tx: Sender<DriverMessage>) -> Self {
+    pub fn bound(
+        conn_id: roam_wire::ConnectionId,
+        channel_id: ChannelId,
+        tx: Sender<Vec<u8>>,
+        driver_tx: Sender<DriverMessage>,
+    ) -> Self {
         Self {
+            conn_id,
             channel_id,
             sender: SenderSlot::new(tx),
             driver_tx: DriverTxSlot::new(driver_tx),
@@ -327,6 +339,7 @@ impl<T: 'static> Tx<T> {
         else if let Some(task_tx) = self.driver_tx.inner.as_ref() {
             task_tx
                 .send(DriverMessage::Data {
+                    conn_id: self.conn_id,
                     channel_id: self.channel_id,
                     payload: bytes,
                 })
@@ -357,6 +370,7 @@ impl<T: 'static> Drop for Tx<T> {
 
         // Sender was taken or never set - send Close via driver_tx if available
         if let Some(task_tx) = self.driver_tx.inner.take() {
+            let conn_id = self.conn_id;
             let channel_id = self.channel_id;
             // Use try_send for synchronous Close delivery.
             // This ensures Close is queued before Response in dispatch_call.
@@ -367,12 +381,20 @@ impl<T: 'static> Drop for Tx<T> {
             // generously (256+) to make this unlikely. A proper fix would use
             // unbounded channels for task messages.
             if task_tx
-                .try_send(DriverMessage::Close { channel_id })
+                .try_send(DriverMessage::Close {
+                    conn_id,
+                    channel_id,
+                })
                 .is_err()
             {
                 // Channel full or closed - spawn as fallback (see warning above)
                 crate::runtime::spawn(async move {
-                    let _ = task_tx.send(DriverMessage::Close { channel_id }).await;
+                    let _ = task_tx
+                        .send(DriverMessage::Close {
+                            conn_id,
+                            channel_id,
+                        })
+                        .await;
                 });
             }
         }
@@ -630,7 +652,7 @@ pub fn channel<T: 'static>() -> (Tx<T>, Rx<T>) {
         let channel_id = ctx.channel_ids.next();
         debug!(channel_id, "roam::channel() creating bound channel pair");
         (
-            Tx::bound(channel_id, sender, ctx.driver_tx.clone()),
+            Tx::bound(ctx.conn_id, channel_id, sender, ctx.driver_tx.clone()),
             Rx::bound(channel_id, receiver),
         )
     } else {
@@ -650,6 +672,7 @@ pub fn channel<T: 'static>() -> (Tx<T>, Rx<T>) {
 /// provides the channel ID allocator and driver_tx needed for binding.
 #[derive(Clone)]
 struct DispatchContext {
+    conn_id: roam_wire::ConnectionId,
     channel_ids: Arc<ChannelIdAllocator>,
     driver_tx: Sender<DriverMessage>,
 }
@@ -712,7 +735,7 @@ use std::collections::{HashMap, HashSet};
 pub struct ResponseData {
     /// The response payload bytes.
     pub payload: Vec<u8>,
-    /// Channel IDs for streams in the response (Rx<T> returned by the method).
+    /// Channel IDs for streams in the response (`Rx<T>` returned by the method).
     /// Client must register receivers for these channels.
     pub channels: Vec<u64>,
 }
@@ -722,10 +745,10 @@ pub struct ResponseData {
 /// This unified channel ensures FIFO ordering: a Call followed by Data
 /// will always be processed in that order, preventing race conditions
 /// where Data could arrive before the Request is sent.
-#[derive(Debug)]
 pub enum DriverMessage {
     /// Send a Request and expect a Response (client-side call).
     Call {
+        conn_id: roam_wire::ConnectionId,
         request_id: u64,
         method_id: u64,
         metadata: Vec<(String, roam_wire::MetadataValue)>,
@@ -736,17 +759,28 @@ pub enum DriverMessage {
     },
     /// Send a Data message on a stream.
     Data {
+        conn_id: roam_wire::ConnectionId,
         channel_id: ChannelId,
         payload: Vec<u8>,
     },
     /// Send a Close message to end a stream.
-    Close { channel_id: ChannelId },
+    Close {
+        conn_id: roam_wire::ConnectionId,
+        channel_id: ChannelId,
+    },
     /// Send a Response message (server-side call completed).
     Response {
+        conn_id: roam_wire::ConnectionId,
         request_id: u64,
         /// Channel IDs for streams in the response (Tx/Rx returned by the method).
         channels: Vec<u64>,
         payload: Vec<u8>,
+    },
+    /// Request to open a new virtual connection.
+    Connect {
+        request_id: u64,
+        metadata: roam_wire::Metadata,
+        response_tx: OneshotSender<Result<ConnectionHandle, crate::ConnectError>>,
     },
 }
 
@@ -758,6 +792,9 @@ pub enum DriverMessage {
 ///
 /// r[impl channeling.unknown] - Unknown stream IDs cause Goodbye.
 pub struct ChannelRegistry {
+    /// Connection ID this registry belongs to.
+    conn_id: roam_wire::ConnectionId,
+
     /// Streams where we receive Data messages (backing `Rx<T>` or `Tx<T>` handles on our side).
     /// Key: channel_id, Value: sender to route Data payloads to the handle.
     incoming: HashMap<ChannelId, Sender<Vec<u8>>>,
@@ -798,7 +835,7 @@ pub struct ChannelRegistry {
 }
 
 impl ChannelRegistry {
-    /// Create a new registry with the given initial credit, driver channel, and role.
+    /// Create a new registry with the given conn_id, initial credit, driver channel, and role.
     ///
     /// The `driver_tx` is used to send all messages (Call/Data/Close/Response)
     /// to the driver for transmission on the wire.
@@ -809,11 +846,13 @@ impl ChannelRegistry {
     ///
     /// r[impl flow.channel.initial-credit] - Each stream starts with this credit.
     pub fn new_with_credit_and_role(
+        conn_id: roam_wire::ConnectionId,
         initial_credit: u32,
         driver_tx: Sender<DriverMessage>,
         role: Role,
     ) -> Self {
         Self {
+            conn_id,
             incoming: HashMap::new(),
             closed: HashSet::new(),
             incoming_credit: HashMap::new(),
@@ -825,11 +864,16 @@ impl ChannelRegistry {
     }
 
     /// Create a new registry with the given initial credit and driver channel.
-    /// Uses Acceptor role for backward compatibility (server-side usage).
+    /// Uses ROOT conn_id and Acceptor role for backward compatibility (server-side usage).
     ///
     /// r[impl flow.channel.initial-credit] - Each stream starts with this credit.
     pub fn new_with_credit(initial_credit: u32, driver_tx: Sender<DriverMessage>) -> Self {
-        Self::new_with_credit_and_role(initial_credit, driver_tx, Role::Acceptor)
+        Self::new_with_credit_and_role(
+            roam_wire::ConnectionId::ROOT,
+            initial_credit,
+            driver_tx,
+            Role::Acceptor,
+        )
     }
 
     /// Create a new registry with default infinite credit.
@@ -841,12 +885,18 @@ impl ChannelRegistry {
         Self::new_with_credit(u32::MAX, driver_tx)
     }
 
+    /// Get the connection ID for this registry.
+    pub fn conn_id(&self) -> roam_wire::ConnectionId {
+        self.conn_id
+    }
+
     /// Get the dispatch context for response channel binding.
     ///
     /// Used by `dispatch_call` and `dispatch_call_infallible` to set up
     /// thread-local context so `roam::channel()` can create bound channels.
     pub(crate) fn dispatch_context(&self) -> DispatchContext {
         DispatchContext {
+            conn_id: self.conn_id,
             channel_ids: self.response_channel_ids.clone(),
             driver_tx: self.driver_tx.clone(),
         }
@@ -1047,7 +1097,10 @@ impl ChannelRegistry {
     }
 
     /// Recursively walk a Poke value looking for Rx/Tx streams to bind.
-    fn bind_streams_recursive(&mut self, poke: facet::Poke<'_, '_>) {
+    #[allow(unsafe_code)]
+    fn bind_streams_recursive(&mut self, mut poke: facet::Poke<'_, '_>) {
+        use facet::Def;
+
         let shape = poke.shape();
 
         trace!(
@@ -1069,18 +1122,66 @@ impl ChannelRegistry {
             }
         }
 
-        // Recurse into struct/tuple fields
-        // (Tuples are represented as structs with numeric field indices in facet)
-        if let Ok(mut ps) = poke.into_struct() {
-            let field_count = ps.field_count();
-            trace!(field_count, "bind_streams_recursive: recursing into struct");
-            for i in 0..field_count {
-                if let Ok(field_poke) = ps.field(i) {
-                    self.bind_streams_recursive(field_poke);
+        // Dispatch based on the shape's definition
+        match shape.def {
+            Def::Scalar => {}
+
+            // Recurse into struct/tuple fields
+            _ if poke.is_struct() => {
+                let mut ps = poke.into_struct().expect("is_struct was true");
+                let field_count = ps.field_count();
+                trace!(field_count, "bind_streams_recursive: recursing into struct");
+                for i in 0..field_count {
+                    if let Ok(field_poke) = ps.field(i) {
+                        self.bind_streams_recursive(field_poke);
+                    }
                 }
             }
+
+            // Recurse into Option<T>
+            Def::Option(_) => {
+                // Option is represented as an enum, use into_enum to access its value
+                if let Ok(mut pe) = poke.into_enum()
+                    && let Ok(Some(inner_poke)) = pe.field(0)
+                {
+                    self.bind_streams_recursive(inner_poke);
+                }
+            }
+
+            // Recurse into list elements (e.g., Vec<Tx<T>>)
+            Def::List(list_def) => {
+                let len = {
+                    let peek = poke.as_peek();
+                    peek.into_list().map(|pl| pl.len()).unwrap_or(0)
+                };
+                // Get mutable access to elements via VTable (no PokeList exists)
+                if let Some(get_mut_fn) = list_def.vtable.get_mut {
+                    let element_shape = list_def.t;
+                    let data_ptr = poke.data_mut();
+                    for i in 0..len {
+                        // SAFETY: We have exclusive mutable access via poke, index < len, shape is correct
+                        let element_ptr = unsafe { (get_mut_fn)(data_ptr, i, element_shape) };
+                        if let Some(ptr) = element_ptr {
+                            // SAFETY: ptr points to a valid element with the correct shape
+                            let element_poke =
+                                unsafe { facet::Poke::from_raw_parts(ptr, element_shape) };
+                            self.bind_streams_recursive(element_poke);
+                        }
+                    }
+                }
+            }
+
+            // Other enum variants
+            _ if poke.is_enum() => {
+                if let Ok(mut pe) = poke.into_enum()
+                    && let Ok(Some(variant_poke)) = pe.field(0)
+                {
+                    self.bind_streams_recursive(variant_poke);
+                }
+            }
+
+            _ => {}
         }
-        // TODO: Handle enums, arrays, etc. if needed
     }
 
     /// Bind an Rx<T> stream for server-side dispatch.
@@ -1121,10 +1222,18 @@ impl ChannelRegistry {
     /// Bind a Tx<T> stream for server-side dispatch.
     ///
     /// Server sends data to client on this stream.
-    /// Sets the driver_tx directly so Tx::send() writes DriverMessage::Data to the wire.
+    /// Sets the conn_id and driver_tx so Tx::send() writes DriverMessage::Data to the wire.
     /// When the Tx is dropped, it sends DriverMessage::Close automatically.
     fn bind_tx_stream(&mut self, poke: facet::Poke<'_, '_>) {
         if let Ok(mut ps) = poke.into_struct() {
+            // Set conn_id so Data/Close messages go to the correct virtual connection
+            // r[impl core.conn.independence]
+            if let Ok(mut conn_id_field) = ps.field_by_name("conn_id")
+                && let Ok(id_ref) = conn_id_field.get_mut::<roam_wire::ConnectionId>()
+            {
+                *id_ref = self.conn_id;
+            }
+
             // Set driver_tx so Tx::send() can write directly to the wire
             if let Ok(mut driver_tx_field) = ps.field_by_name("driver_tx")
                 && let Ok(slot) = driver_tx_field.get_mut::<DriverTxSlot>()
@@ -1295,9 +1404,8 @@ impl Default for RequestIdGenerator {
 /// The `channels` parameter contains channel IDs from the Request message framing.
 /// These are patched into the deserialized args before binding streams.
 pub fn dispatch_call<A, R, E, F, Fut>(
+    cx: &Context,
     payload: Vec<u8>,
-    channels: Vec<u64>,
-    request_id: u64,
     registry: &mut ChannelRegistry,
     handler: F,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
@@ -1308,6 +1416,10 @@ where
     F: FnOnce(A) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<R, E>> + Send + 'static,
 {
+    let conn_id = cx.conn_id;
+    let request_id = cx.request_id.raw();
+    let channels = &cx.channels;
+
     // Deserialize args
     let mut args: A = match facet_postcard::from_slice(&payload) {
         Ok(args) => args,
@@ -1317,6 +1429,7 @@ where
                 // InvalidPayload error: Result::Err(1) + RoamError::InvalidPayload(2)
                 let _ = task_tx
                     .send(DriverMessage::Response {
+                        conn_id,
                         request_id,
                         channels: Vec::new(),
                         payload: vec![1, 2],
@@ -1328,7 +1441,7 @@ where
 
     // Patch channel IDs from Request framing into deserialized args
     debug!(channels = ?channels, "dispatch_call: patching channel IDs");
-    patch_channel_ids(&mut args, &channels);
+    patch_channel_ids(&mut args, channels);
 
     // Bind streams via reflection - THIS MUST HAPPEN SYNCHRONOUSLY
     debug!("dispatch_call: binding streams SYNC");
@@ -1377,6 +1490,7 @@ where
         // ForwardingDispatcher uses these to set up Data forwarding.
         let _ = task_tx
             .send(DriverMessage::Response {
+                conn_id,
                 request_id,
                 channels: response_channels,
                 payload,
@@ -1389,9 +1503,8 @@ where
 ///
 /// Same as `dispatch_call` but for handlers that cannot fail at the application level.
 pub fn dispatch_call_infallible<A, R, F, Fut>(
+    cx: &Context,
     payload: Vec<u8>,
-    channels: Vec<u64>,
-    request_id: u64,
     registry: &mut ChannelRegistry,
     handler: F,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
@@ -1401,6 +1514,10 @@ where
     F: FnOnce(A) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = R> + Send + 'static,
 {
+    let conn_id = cx.conn_id;
+    let request_id = cx.request_id.raw();
+    let channels = &cx.channels;
+
     // Deserialize args
     let mut args: A = match facet_postcard::from_slice(&payload) {
         Ok(args) => args,
@@ -1410,6 +1527,7 @@ where
                 // InvalidPayload error: Result::Err(1) + RoamError::InvalidPayload(2)
                 let _ = task_tx
                     .send(DriverMessage::Response {
+                        conn_id,
                         request_id,
                         channels: Vec::new(),
                         payload: vec![1, 2],
@@ -1420,7 +1538,7 @@ where
     };
 
     // Patch channel IDs from Request framing into deserialized args
-    patch_channel_ids(&mut args, &channels);
+    patch_channel_ids(&mut args, channels);
 
     // Bind streams via reflection
     registry.bind_streams(&mut args);
@@ -1457,6 +1575,7 @@ where
         // ForwardingDispatcher uses these to set up Data forwarding.
         let _ = task_tx
             .send(DriverMessage::Response {
+                conn_id,
                 request_id,
                 channels: response_channels,
                 payload,
@@ -1469,14 +1588,17 @@ where
 ///
 /// Used by dispatchers when the method_id doesn't match any known method.
 pub fn dispatch_unknown_method(
-    request_id: u64,
+    cx: &Context,
     registry: &mut ChannelRegistry,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+    let conn_id = cx.conn_id;
+    let request_id = cx.request_id.raw();
     let task_tx = registry.driver_tx();
     Box::pin(async move {
         // UnknownMethod error
         let _ = task_tx
             .send(DriverMessage::Response {
+                conn_id,
                 request_id,
                 channels: Vec::new(),
                 payload: vec![1, 1],
@@ -1653,6 +1775,84 @@ fn patch_channel_ids_recursive(mut poke: facet::Poke<'_, '_>, channels: &[u64], 
 // Service Dispatcher
 // ============================================================================
 
+/// Context passed to service method implementations.
+///
+/// Contains information about the request that may be useful to the handler:
+/// - `conn_id`: Which virtual connection the request came from
+/// - `metadata`: Key-value pairs sent with the request
+///
+/// This enables services to identify callers and access per-request metadata.
+#[derive(Debug, Clone)]
+pub struct Context {
+    /// The connection ID this request arrived on.
+    ///
+    /// For virtual connections, this identifies which specific connection
+    /// the request came from, enabling bidirectional communication.
+    pub conn_id: roam_wire::ConnectionId,
+
+    /// The request ID for this call.
+    ///
+    /// Unique within the connection; used for response routing and cancellation.
+    pub request_id: roam_wire::RequestId,
+
+    /// The method ID being called.
+    pub method_id: roam_wire::MethodId,
+
+    /// Metadata sent with the request.
+    ///
+    /// This is the `metadata` field from the wire `Request` message.
+    pub metadata: roam_wire::Metadata,
+
+    /// Channel IDs from the request, in argument declaration order.
+    ///
+    /// Used for stream binding. Proxies can use this to remap channel IDs.
+    pub channels: Vec<u64>,
+}
+
+impl Context {
+    /// Create a new context.
+    pub fn new(
+        conn_id: roam_wire::ConnectionId,
+        request_id: roam_wire::RequestId,
+        method_id: roam_wire::MethodId,
+        metadata: roam_wire::Metadata,
+        channels: Vec<u64>,
+    ) -> Self {
+        Self {
+            conn_id,
+            request_id,
+            method_id,
+            metadata,
+            channels,
+        }
+    }
+
+    /// Get the connection ID.
+    pub fn conn_id(&self) -> roam_wire::ConnectionId {
+        self.conn_id
+    }
+
+    /// Get the request ID.
+    pub fn request_id(&self) -> roam_wire::RequestId {
+        self.request_id
+    }
+
+    /// Get the method ID.
+    pub fn method_id(&self) -> roam_wire::MethodId {
+        self.method_id
+    }
+
+    /// Get the request metadata.
+    pub fn metadata(&self) -> &roam_wire::Metadata {
+        &self.metadata
+    }
+
+    /// Get the channel IDs.
+    pub fn channels(&self) -> &[u64] {
+        &self.channels
+    }
+}
+
 /// Trait for dispatching requests to a service.
 ///
 /// The dispatcher handles both simple and channeling methods uniformly.
@@ -1667,9 +1867,9 @@ pub trait ServiceDispatcher: Send + Sync {
     /// Dispatch a request and send the response via the task channel.
     ///
     /// The dispatcher is responsible for:
-    /// - Looking up the method by method_id
+    /// - Looking up the method by `cx.method_id()`
     /// - Deserializing arguments from payload
-    /// - Patching channel IDs from `channels` into deserialized args via `patch_channel_ids()`
+    /// - Patching channel IDs from `cx.channels()` into deserialized args via `patch_channel_ids()`
     /// - Binding any Tx/Rx streams via the registry
     /// - Calling the service method
     /// - Sending Data/Close messages for any Tx streams
@@ -1678,7 +1878,7 @@ pub trait ServiceDispatcher: Send + Sync {
     /// By using a single channel for Data/Close/Response, correct ordering is guaranteed:
     /// all stream Data and Close messages are sent before the Response.
     ///
-    /// The `channels` parameter contains channel IDs from the Request message framing,
+    /// The `cx.channels()` contains channel IDs from the Request message framing,
     /// in declaration order. For a ForwardingDispatcher, this enables transparent proxying
     /// without parsing the payload.
     ///
@@ -1688,10 +1888,8 @@ pub trait ServiceDispatcher: Send + Sync {
     /// r[impl channeling.allocation.caller] - Stream IDs are from Request.channels (caller allocated).
     fn dispatch(
         &self,
-        method_id: u64,
+        cx: &Context,
         payload: Vec<u8>,
-        channels: Vec<u64>,
-        request_id: u64,
         registry: &mut ChannelRegistry,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 }
@@ -1737,18 +1935,14 @@ where
 
     fn dispatch(
         &self,
-        method_id: u64,
+        cx: &Context,
         payload: Vec<u8>,
-        channels: Vec<u64>,
-        request_id: u64,
         registry: &mut ChannelRegistry,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
-        if self.primary_methods.contains(&method_id) {
-            self.primary
-                .dispatch(method_id, payload, channels, request_id, registry)
+        if self.primary_methods.contains(&cx.method_id().raw()) {
+            self.primary.dispatch(cx, payload, registry)
         } else {
-            self.fallback
-                .dispatch(method_id, payload, channels, request_id, registry)
+            self.fallback.dispatch(cx, payload, registry)
         }
     }
 }
@@ -1804,14 +1998,16 @@ impl ServiceDispatcher for ForwardingDispatcher {
 
     fn dispatch(
         &self,
-        method_id: u64,
+        cx: &Context,
         payload: Vec<u8>,
-        channels: Vec<u64>,
-        request_id: u64,
         registry: &mut ChannelRegistry,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
         let task_tx = registry.driver_tx();
         let upstream = self.upstream.clone();
+        let conn_id = cx.conn_id;
+        let method_id = cx.method_id.raw();
+        let request_id = cx.request_id.raw();
+        let channels = cx.channels.clone();
 
         if channels.is_empty() {
             // Unary call - but response may contain Rx<T> channels
@@ -1854,8 +2050,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
 
                         debug!(
                             upstream_id,
-                            downstream_id,
-                            "ForwardingDispatcher: mapping channel IDs"
+                            downstream_id, "ForwardingDispatcher: mapping channel IDs"
                         );
 
                         // Set up forwarding: upstream → downstream
@@ -1866,8 +2061,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
                         crate::runtime::spawn(async move {
                             debug!(
                                 upstream_id,
-                                downstream_id,
-                                "ForwardingDispatcher: forwarding task started"
+                                downstream_id, "ForwardingDispatcher: forwarding task started"
                             );
                             while let Some(data) = rx.recv().await {
                                 debug!(
@@ -1878,6 +2072,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
                                 );
                                 let _ = task_tx_clone
                                     .send(DriverMessage::Data {
+                                        conn_id,
                                         channel_id: downstream_id,
                                         payload: data,
                                     })
@@ -1891,6 +2086,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
                             // Channel closed
                             let _ = task_tx_clone
                                 .send(DriverMessage::Close {
+                                    conn_id,
                                     channel_id: downstream_id,
                                 })
                                 .await;
@@ -1900,6 +2096,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
 
                 let _ = task_tx
                     .send(DriverMessage::Response {
+                        conn_id,
                         request_id,
                         channels: downstream_channels,
                         payload: response_payload,
@@ -1950,6 +2147,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
 
                 // Now spawn forwarding tasks - safe because Request is queued first
                 // and command_tx/task_tx are processed in order by the driver
+                let upstream_conn_id = upstream.conn_id();
                 for (i, mut rx) in ds_to_us_rxs.into_iter().enumerate() {
                     let upstream_id = channel_map[i].1;
                     let upstream_task_tx = upstream_task_tx.clone();
@@ -1957,6 +2155,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
                         while let Some(data) = rx.recv().await {
                             let _ = upstream_task_tx
                                 .send(DriverMessage::Data {
+                                    conn_id: upstream_conn_id,
                                     channel_id: upstream_id,
                                     payload: data,
                                 })
@@ -1965,6 +2164,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
                         // Channel closed
                         let _ = upstream_task_tx
                             .send(DriverMessage::Close {
+                                conn_id: upstream_conn_id,
                                 channel_id: upstream_id,
                             })
                             .await;
@@ -1978,6 +2178,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
                         while let Some(data) = rx.recv().await {
                             let _ = task_tx
                                 .send(DriverMessage::Data {
+                                    conn_id,
                                     channel_id: downstream_id,
                                     payload: data,
                                 })
@@ -1986,6 +2187,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
                         // Channel closed
                         let _ = task_tx
                             .send(DriverMessage::Close {
+                                conn_id,
                                 channel_id: downstream_id,
                             })
                             .await;
@@ -2020,6 +2222,7 @@ impl ServiceDispatcher for ForwardingDispatcher {
 
                 let _ = task_tx
                     .send(DriverMessage::Response {
+                        conn_id,
                         request_id,
                         channels: downstream_response_channels,
                         payload: response_payload,
@@ -2278,11 +2481,26 @@ pub trait Caller: Clone + Send + Sync + 'static {
         &self,
         method_id: u64,
         args: &mut T,
-    ) -> impl Future<Output = Result<ResponseData, TransportError>> + Send;
+    ) -> impl std::future::Future<Output = Result<ResponseData, TransportError>> + Send {
+        self.call_with_metadata(method_id, args, roam_wire::Metadata::default())
+    }
 
-    /// Bind receivers for Rx<T> streams in the response.
+    /// Make an RPC call with the given method ID, arguments, and metadata.
     ///
-    /// After deserializing a response, any Rx<T> values in it are "hollow" -
+    /// The arguments are mutable because stream bindings (Tx/Rx) need to be
+    /// assigned channel IDs before serialization.
+    ///
+    /// Returns ResponseData containing the payload and any response channel IDs.
+    fn call_with_metadata<T: Facet<'static> + Send>(
+        &self,
+        method_id: u64,
+        args: &mut T,
+        metadata: roam_wire::Metadata,
+    ) -> impl std::future::Future<Output = Result<ResponseData, TransportError>> + Send;
+
+    /// Bind receivers for `Rx<T>` streams in the response.
+    ///
+    /// After deserializing a response, any `Rx<T>` values in it are "hollow" -
     /// they have channel IDs but no actual receiver. This method walks the
     /// response and binds receivers for each Rx using the channel IDs from
     /// the Response message.
@@ -2302,13 +2520,13 @@ pub trait Caller: Clone + Send + Sync + 'static {
 }
 
 impl Caller for ConnectionHandle {
-    fn call<T: Facet<'static> + Send>(
+    async fn call_with_metadata<T: Facet<'static> + Send>(
         &self,
         method_id: u64,
         args: &mut T,
-    ) -> impl Future<Output = Result<ResponseData, TransportError>> + Send {
-        // Delegate to the inherent async method
-        ConnectionHandle::call(self, method_id, args)
+        metadata: roam_wire::Metadata,
+    ) -> Result<ResponseData, TransportError> {
+        ConnectionHandle::call_with_metadata(self, method_id, args, metadata).await
     }
 
     fn bind_response_streams<T: Facet<'static>>(&self, response: &mut T, channels: &[u64]) {
@@ -2316,8 +2534,102 @@ impl Caller for ConnectionHandle {
     }
 }
 
+// ============================================================================
+// CallFuture - Builder pattern for RPC calls with optional metadata
+// ============================================================================
+
+/// A future representing an RPC call that can be configured with metadata.
+///
+/// This provides a builder pattern for RPC calls:
+/// - `client.method(args).await` - Simple call with default (empty) metadata
+/// - `client.method(args).with_metadata(meta).await` - Call with custom metadata
+///
+/// The future is lazy - the RPC call is not made until `.await` is called.
+///
+/// # Example
+///
+/// ```ignore
+/// // Simple call
+/// let result = client.subscribe(route).await?;
+///
+/// // With metadata
+/// let result = client.subscribe(route)
+///     .with_metadata(vec![("trace-id".into(), MetadataValue::String("abc".into()))])
+///     .await?;
+/// ```
+pub struct CallFuture<C, Args, Ok, Err>
+where
+    C: Caller,
+    Args: Facet<'static>,
+{
+    caller: C,
+    method_id: u64,
+    args: Args,
+    metadata: roam_wire::Metadata,
+    _phantom: PhantomData<fn() -> (Ok, Err)>,
+}
+
+impl<C, Args, Ok, Err> CallFuture<C, Args, Ok, Err>
+where
+    C: Caller,
+    Args: Facet<'static>,
+{
+    /// Create a new CallFuture.
+    pub fn new(caller: C, method_id: u64, args: Args) -> Self {
+        Self {
+            caller,
+            method_id,
+            args,
+            metadata: roam_wire::Metadata::default(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Set metadata for this call.
+    ///
+    /// Metadata is a list of key-value pairs that will be sent with the request.
+    /// The server can access this via `Context::metadata()`.
+    pub fn with_metadata(mut self, metadata: roam_wire::Metadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+impl<C, Args, Ok, Err> std::future::IntoFuture for CallFuture<C, Args, Ok, Err>
+where
+    C: Caller,
+    Args: Facet<'static> + Send + 'static,
+    Ok: Facet<'static> + Send + 'static,
+    Err: Facet<'static> + Send + 'static,
+{
+    type Output = Result<Ok, CallError<Err>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let CallFuture {
+            caller,
+            method_id,
+            mut args,
+            metadata,
+            _phantom,
+        } = self;
+
+        Box::pin(async move {
+            let response = caller
+                .call_with_metadata(method_id, &mut args, metadata)
+                .await
+                .map_err(CallError::from)?;
+            let mut result = decode_response::<Ok, Err>(&response.payload)?;
+            caller.bind_response_streams(&mut result, &response.channels);
+            Ok(result)
+        })
+    }
+}
+
 /// Shared state between ConnectionHandle and Driver.
 struct HandleShared {
+    /// Connection ID for this handle (0 = root connection).
+    conn_id: roam_wire::ConnectionId,
     /// Unified channel to send all messages to the driver.
     driver_tx: Sender<DriverMessage>,
     /// Request ID generator.
@@ -2351,19 +2663,26 @@ pub struct ConnectionHandle {
 }
 
 impl ConnectionHandle {
-    /// Create a new handle with the given driver channel and role.
+    /// Create a new handle for the root connection (conn_id = 0).
     ///
     /// All messages (Call/Data/Close/Response) go through a single unified channel
     /// to ensure FIFO ordering.
     pub fn new(driver_tx: Sender<DriverMessage>, role: Role, initial_credit: u32) -> Self {
-        Self::new_with_diagnostics(driver_tx, role, initial_credit, None)
+        Self::new_with_diagnostics(
+            roam_wire::ConnectionId::ROOT,
+            driver_tx,
+            role,
+            initial_credit,
+            None,
+        )
     }
 
-    /// Create a new handle with optional diagnostic state for SIGUSR1 dumps.
+    /// Create a new handle with a specific connection ID and optional diagnostic state.
     ///
     /// If `diagnostic_state` is provided, all RPC calls and channels will be tracked
     /// for debugging purposes.
     pub fn new_with_diagnostics(
+        conn_id: roam_wire::ConnectionId,
         driver_tx: Sender<DriverMessage>,
         role: Role,
         initial_credit: u32,
@@ -2372,6 +2691,7 @@ impl ConnectionHandle {
         let channel_registry = ChannelRegistry::new_with_credit(initial_credit, driver_tx.clone());
         Self {
             shared: Arc::new(HandleShared {
+                conn_id,
                 driver_tx,
                 request_ids: RequestIdGenerator::new(),
                 channel_ids: ChannelIdAllocator::new(role),
@@ -2379,6 +2699,11 @@ impl ConnectionHandle {
                 diagnostic_state,
             }),
         }
+    }
+
+    /// Get the connection ID for this handle.
+    pub fn conn_id(&self) -> roam_wire::ConnectionId {
+        self.shared.conn_id
     }
 
     /// Get the diagnostic state, if any.
@@ -2417,10 +2742,22 @@ impl ConnectionHandle {
     /// let response = handle.call(method_id::SUM, &mut (rx,)).await?;
     /// // tx.send(&42).await to push values
     /// ```
+    /// Make an RPC call with default (empty) metadata.
     pub async fn call<T: Facet<'static>>(
         &self,
         method_id: u64,
         args: &mut T,
+    ) -> Result<ResponseData, TransportError> {
+        self.call_with_metadata(method_id, args, roam_wire::Metadata::default())
+            .await
+    }
+
+    /// Make an RPC call with custom metadata.
+    pub async fn call_with_metadata<T: Facet<'static>>(
+        &self,
+        method_id: u64,
+        args: &mut T,
+        metadata: roam_wire::Metadata,
     ) -> Result<ResponseData, TransportError> {
         // Walk args and bind any streams (allocates channel IDs)
         // This collects receivers that need to be drained but does NOT spawn
@@ -2452,8 +2789,10 @@ impl ConnectionHandle {
 
         if drains.is_empty() {
             // No Rx streams - simple call
-            self.call_raw_with_channels(method_id, channels, payload, args_debug)
-                .await
+            self.call_raw_with_channels_and_metadata(
+                method_id, channels, payload, args_debug, metadata,
+            )
+            .await
         } else {
             // Has Rx streams - spawn tasks to drain them
             // IMPORTANT: We must send Request BEFORE spawning drain tasks to ensure ordering.
@@ -2475,9 +2814,10 @@ impl ConnectionHandle {
             }
 
             let msg = DriverMessage::Call {
+                conn_id: self.shared.conn_id,
                 request_id,
                 method_id,
-                metadata: Vec::new(),
+                metadata,
                 channels,
                 payload,
                 response_tx,
@@ -2489,6 +2829,7 @@ impl ConnectionHandle {
             }
 
             let task_tx = self.shared.channel_registry.lock().unwrap().driver_tx();
+            let conn_id = self.shared.conn_id;
 
             // Spawn a task for each drain to forward data to driver
             for (channel_id, mut rx) in drains {
@@ -2505,6 +2846,7 @@ impl ConnectionHandle {
                                 // Send data to driver
                                 let _ = task_tx
                                     .send(DriverMessage::Data {
+                                        conn_id,
                                         channel_id,
                                         payload,
                                     })
@@ -2517,7 +2859,12 @@ impl ConnectionHandle {
                             None => {
                                 debug!("drain task: channel {} closed", channel_id);
                                 // Channel closed, send Close and exit
-                                let _ = task_tx.send(DriverMessage::Close { channel_id }).await;
+                                let _ = task_tx
+                                    .send(DriverMessage::Close {
+                                        conn_id,
+                                        channel_id,
+                                    })
+                                    .await;
                                 debug!(
                                     "drain task: sent DriverMessage::Close for channel {}",
                                     channel_id
@@ -2556,11 +2903,14 @@ impl ConnectionHandle {
     }
 
     /// Recursively walk a Poke value looking for Rx/Tx streams to bind.
+    #[allow(unsafe_code)]
     fn bind_streams_recursive(
         &self,
-        poke: facet::Poke<'_, '_>,
+        mut poke: facet::Poke<'_, '_>,
         drains: &mut Vec<(ChannelId, Receiver<Vec<u8>>)>,
     ) {
+        use facet::Def;
+
         let shape = poke.shape();
 
         // Check if this is an Rx or Tx type
@@ -2574,16 +2924,65 @@ impl ConnectionHandle {
             }
         }
 
-        // Recurse into struct fields
-        if let Ok(mut ps) = poke.into_struct() {
-            let field_count = ps.field_count();
-            for i in 0..field_count {
-                if let Ok(field_poke) = ps.field(i) {
-                    self.bind_streams_recursive(field_poke, drains);
+        // Dispatch based on the shape's definition
+        match shape.def {
+            Def::Scalar => {}
+
+            // Recurse into struct/tuple fields
+            _ if poke.is_struct() => {
+                let mut ps = poke.into_struct().expect("is_struct was true");
+                let field_count = ps.field_count();
+                for i in 0..field_count {
+                    if let Ok(field_poke) = ps.field(i) {
+                        self.bind_streams_recursive(field_poke, drains);
+                    }
                 }
             }
+
+            // Recurse into Option<T>
+            Def::Option(_) => {
+                // Option is represented as an enum, use into_enum to access its value
+                if let Ok(mut pe) = poke.into_enum()
+                    && let Ok(Some(inner_poke)) = pe.field(0)
+                {
+                    self.bind_streams_recursive(inner_poke, drains);
+                }
+            }
+
+            // Recurse into list elements (e.g., Vec<Tx<T>>)
+            Def::List(list_def) => {
+                let len = {
+                    let peek = poke.as_peek();
+                    peek.into_list().map(|pl| pl.len()).unwrap_or(0)
+                };
+                // Get mutable access to elements via VTable (no PokeList exists)
+                if let Some(get_mut_fn) = list_def.vtable.get_mut {
+                    let element_shape = list_def.t;
+                    let data_ptr = poke.data_mut();
+                    for i in 0..len {
+                        // SAFETY: We have exclusive mutable access via poke, index < len, shape is correct
+                        let element_ptr = unsafe { (get_mut_fn)(data_ptr, i, element_shape) };
+                        if let Some(ptr) = element_ptr {
+                            // SAFETY: ptr points to a valid element with the correct shape
+                            let element_poke =
+                                unsafe { facet::Poke::from_raw_parts(ptr, element_shape) };
+                            self.bind_streams_recursive(element_poke, drains);
+                        }
+                    }
+                }
+            }
+
+            // Other enum variants
+            _ if poke.is_enum() => {
+                if let Ok(mut pe) = poke.into_enum()
+                    && let Ok(Some(variant_poke)) = pe.field(0)
+                {
+                    self.bind_streams_recursive(variant_poke, drains);
+                }
+            }
+
+            _ => {}
         }
-        // TODO: Handle tuples, enums, arrays, etc.
     }
 
     /// Bind an Rx<T> stream - caller passes receiver, keeps sender.
@@ -2594,14 +2993,21 @@ impl ConnectionHandle {
         drains: &mut Vec<(ChannelId, Receiver<Vec<u8>>)>,
     ) {
         let channel_id = self.alloc_channel_id();
-        debug!(channel_id, "OutgoingBinder::bind_rx_stream: allocated channel_id for Rx");
+        debug!(
+            channel_id,
+            "OutgoingBinder::bind_rx_stream: allocated channel_id for Rx"
+        );
 
         if let Ok(mut ps) = poke.into_struct() {
             // Set channel_id field by getting mutable access to the u64
             if let Ok(mut channel_id_field) = ps.field_by_name("channel_id")
                 && let Ok(id_ref) = channel_id_field.get_mut::<ChannelId>()
             {
-                debug!(old_id = *id_ref, new_id = channel_id, "OutgoingBinder::bind_rx_stream: overwriting channel_id");
+                debug!(
+                    old_id = *id_ref,
+                    new_id = channel_id,
+                    "OutgoingBinder::bind_rx_stream: overwriting channel_id"
+                );
                 *id_ref = channel_id;
             }
 
@@ -2610,7 +3016,10 @@ impl ConnectionHandle {
                 && let Ok(slot) = receiver_field.get_mut::<ReceiverSlot>()
                 && let Some(rx) = slot.take()
             {
-                debug!(channel_id, "OutgoingBinder::bind_rx_stream: took receiver, adding to drains");
+                debug!(
+                    channel_id,
+                    "OutgoingBinder::bind_rx_stream: took receiver, adding to drains"
+                );
                 drains.push((channel_id, rx));
             }
         }
@@ -2620,14 +3029,21 @@ impl ConnectionHandle {
     /// We take the sender and register for incoming Data routing.
     fn bind_tx_stream(&self, poke: facet::Poke<'_, '_>) {
         let channel_id = self.alloc_channel_id();
-        debug!(channel_id, "OutgoingBinder::bind_tx_stream: allocated channel_id for Tx");
+        debug!(
+            channel_id,
+            "OutgoingBinder::bind_tx_stream: allocated channel_id for Tx"
+        );
 
         if let Ok(mut ps) = poke.into_struct() {
             // Set channel_id field by getting mutable access to the u64
             if let Ok(mut channel_id_field) = ps.field_by_name("channel_id")
                 && let Ok(id_ref) = channel_id_field.get_mut::<ChannelId>()
             {
-                debug!(old_id = *id_ref, new_id = channel_id, "OutgoingBinder::bind_tx_stream: overwriting channel_id");
+                debug!(
+                    old_id = *id_ref,
+                    new_id = channel_id,
+                    "OutgoingBinder::bind_tx_stream: overwriting channel_id"
+                );
                 *id_ref = channel_id;
             }
 
@@ -2636,7 +3052,10 @@ impl ConnectionHandle {
                 && let Ok(slot) = sender_field.get_mut::<SenderSlot>()
                 && let Some(tx) = slot.take()
             {
-                debug!(channel_id, "OutgoingBinder::bind_tx_stream: took sender, registering for incoming");
+                debug!(
+                    channel_id,
+                    "OutgoingBinder::bind_tx_stream: took sender, registering for incoming"
+                );
                 // Register for incoming Data routing
                 self.register_incoming(channel_id, tx);
             }
@@ -2670,6 +3089,18 @@ impl ConnectionHandle {
         args_debug: Option<String>,
     ) -> Result<ResponseData, TransportError> {
         self.call_raw_full(method_id, Vec::new(), channels, payload, args_debug)
+            .await
+    }
+
+    async fn call_raw_with_channels_and_metadata(
+        &self,
+        method_id: u64,
+        channels: Vec<u64>,
+        payload: Vec<u8>,
+        args_debug: Option<String>,
+        metadata: roam_wire::Metadata,
+    ) -> Result<ResponseData, TransportError> {
+        self.call_raw_full(method_id, metadata, channels, payload, args_debug)
             .await
     }
 
@@ -2714,6 +3145,7 @@ impl ConnectionHandle {
         }
 
         let msg = DriverMessage::Call {
+            conn_id: self.shared.conn_id,
             request_id,
             method_id,
             metadata,
@@ -2739,6 +3171,50 @@ impl ConnectionHandle {
         }
 
         result
+    }
+
+    /// Open a new virtual connection on the link.
+    ///
+    /// Sends a `Connect` message to the remote peer and waits for an
+    /// `Accept` or `Reject` response. Returns a new `ConnectionHandle`
+    /// for the virtual connection if accepted.
+    ///
+    /// r[impl core.conn.open]
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` - Optional metadata to send with the Connect request
+    ///   (e.g., authentication tokens, routing hints).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Open a new virtual connection
+    /// let virtual_conn = handle.connect(vec![]).await?;
+    ///
+    /// // Use the new connection for calls
+    /// let response = virtual_conn.call_raw(method_id, payload).await?;
+    /// ```
+    pub async fn connect(
+        &self,
+        metadata: roam_wire::Metadata,
+    ) -> Result<ConnectionHandle, crate::ConnectError> {
+        let request_id = self.shared.request_ids.next();
+        let (response_tx, response_rx) = oneshot();
+
+        let msg = DriverMessage::Connect {
+            request_id,
+            metadata,
+            response_tx,
+        };
+
+        self.shared.driver_tx.send(msg).await.map_err(|_| {
+            crate::ConnectError::ConnectFailed(std::io::Error::other("driver gone"))
+        })?;
+
+        response_rx
+            .await
+            .map_err(|_| crate::ConnectError::ConnectFailed(std::io::Error::other("driver gone")))?
     }
 
     /// Allocate a stream ID for an outgoing stream.
@@ -2855,11 +3331,11 @@ impl ConnectionHandle {
         self.shared.channel_registry.lock().unwrap().driver_tx()
     }
 
-    /// Bind receivers for Rx<T> streams in a deserialized response.
+    /// Bind receivers for `Rx<T>` streams in a deserialized response.
     ///
     /// After deserializing a response, any `Rx<T>` values are "hollow" - they have
     /// channel IDs but no actual receiver. This method walks the response using
-    /// reflection and binds receivers for each Rx<T> so data can be received.
+    /// reflection and binds receivers for each `Rx<T>` so data can be received.
     ///
     /// # How it works
     ///
@@ -2885,7 +3361,10 @@ impl ConnectionHandle {
     }
 
     /// Recursively walk a Poke value looking for Rx streams to bind in responses.
-    fn bind_response_streams_recursive(&self, poke: facet::Poke<'_, '_>) {
+    #[allow(unsafe_code)]
+    fn bind_response_streams_recursive(&self, mut poke: facet::Poke<'_, '_>) {
+        use facet::Def;
+
         let shape = poke.shape();
 
         // Check if this is an Rx type - only Rx needs binding in responses
@@ -2895,16 +3374,65 @@ impl ConnectionHandle {
             return;
         }
 
-        // Recurse into struct/tuple fields
-        if let Ok(mut ps) = poke.into_struct() {
-            let field_count = ps.field_count();
-            for i in 0..field_count {
-                if let Ok(field_poke) = ps.field(i) {
-                    self.bind_response_streams_recursive(field_poke);
+        // Dispatch based on the shape's definition
+        match shape.def {
+            Def::Scalar => {}
+
+            // Recurse into struct/tuple fields
+            _ if poke.is_struct() => {
+                let mut ps = poke.into_struct().expect("is_struct was true");
+                let field_count = ps.field_count();
+                for i in 0..field_count {
+                    if let Ok(field_poke) = ps.field(i) {
+                        self.bind_response_streams_recursive(field_poke);
+                    }
                 }
             }
+
+            // Recurse into Option<T>
+            Def::Option(_) => {
+                // Option is represented as an enum, use into_enum to access its value
+                if let Ok(mut pe) = poke.into_enum()
+                    && let Ok(Some(inner_poke)) = pe.field(0)
+                {
+                    self.bind_response_streams_recursive(inner_poke);
+                }
+            }
+
+            // Recurse into list elements (e.g., Vec<Rx<T>>)
+            Def::List(list_def) => {
+                let len = {
+                    let peek = poke.as_peek();
+                    peek.into_list().map(|pl| pl.len()).unwrap_or(0)
+                };
+                // Get mutable access to elements via VTable (no PokeList exists)
+                if let Some(get_mut_fn) = list_def.vtable.get_mut {
+                    let element_shape = list_def.t;
+                    let data_ptr = poke.data_mut();
+                    for i in 0..len {
+                        // SAFETY: We have exclusive mutable access via poke, index < len, shape is correct
+                        let element_ptr = unsafe { (get_mut_fn)(data_ptr, i, element_shape) };
+                        if let Some(ptr) = element_ptr {
+                            // SAFETY: ptr points to a valid element with the correct shape
+                            let element_poke =
+                                unsafe { facet::Poke::from_raw_parts(ptr, element_shape) };
+                            self.bind_response_streams_recursive(element_poke);
+                        }
+                    }
+                }
+            }
+
+            // Other enum variants
+            _ if poke.is_enum() => {
+                if let Ok(mut pe) = poke.into_enum()
+                    && let Ok(Some(variant_poke)) = pe.field(0)
+                {
+                    self.bind_response_streams_recursive(variant_poke);
+                }
+            }
+
+            _ => {}
         }
-        // TODO: Handle enums, arrays, etc. if needed
     }
 
     /// Bind a single Rx<T> stream from a response.

@@ -192,6 +192,13 @@ All core ShmBytes functionality is implemented and tested:
     - Test service `ShmBytesTestbed` with methods for creating/reading/processing ShmBytes
     - Tests pass: `shm_bytes_host_to_guest`, `shm_bytes_guest_to_host`, `shm_bytes_round_trip_processing`
 
+19. **Example: zip_service** ([rust/roam-shm/examples/zip_service.rs](../rust/roam-shm/examples/zip_service.rs))
+    - Demonstrates real-world usage of `ShmBytes` for zero-copy file handling
+    - `FsService` (guest): reads files into `ShmBytes` buffers
+    - `ZipService` (host): parses "zip" files, takes ownership of `ShmBytes`, provides handles for exploration
+    - Shows stateful service holding `ShmBytes` across multiple RPC calls
+    - Run with: `cargo run --example zip_service -p roam-shm --features tracing`
+
 ### 🔲 Future Enhancements (Not Critical)
 
 1. **Error on non-SHM transports** (optional)
@@ -215,6 +222,8 @@ All core ShmBytes functionality is implemented and tested:
 | `rust/roam-stream/src/driver.rs` | `Client` impl of `Caller` with `Send` future |
 | `rust/roam-macros/src/lib.rs` | Generated client calls `Caller::patch_response` after decode |
 | `rust/roam-shm/tests/driver.rs` | E2E tests for ShmBytes |
+| `rust/roam-shm/examples/zip_service.rs` | **NEW** Example demonstrating zero-copy file handling with stateful services |
+| `rust/roam-shm/Cargo.toml` | Added example entry and tokio features for example |
 
 ## Next Steps
 

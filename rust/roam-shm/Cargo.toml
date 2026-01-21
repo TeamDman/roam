@@ -37,7 +37,7 @@ libproc = "0.14"
 shm-primitives.workspace = true
 tempfile = "3"
 libc = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "fs"] }
 roam-session.workspace = true
 roam.workspace = true
 roam-tracing.workspace = true
@@ -51,3 +51,7 @@ name = "guest_process"
 path = "tests/support/guest_process_main.rs"
 test = false
 bench = false
+
+[[example]]
+name = "zip_service"
+required-features = ["tracing"]

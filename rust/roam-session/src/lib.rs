@@ -697,6 +697,16 @@ roam_task_local::task_local! {
 /// buffer lengths from slot metadata.
 pub type PatchHook = fn(poke: facet::Poke<'_, '_>);
 
+/// A function that marks data as in-flight before serialization.
+///
+/// This hook is called inside the async dispatch context (after task-locals
+/// like `SHM_POOL` are set) before the result is serialized. Transports
+/// can use this to transition ownership of resources being sent.
+///
+/// For example, `ShmBytes` needs to be marked as in-flight before sending
+/// so the receiver can claim ownership.
+pub type MarkInFlightHook = fn(peek: facet::Peek<'_, '_>);
+
 roam_task_local::task_local! {
     /// Task-local hook for post-deserialization patching.
     ///
@@ -704,6 +714,13 @@ roam_task_local::task_local! {
     /// within their task-local context. Called inside `dispatch_call` after
     /// the future is polled (when transport task-locals are available).
     pub static PATCH_HOOK: PatchHook;
+
+    /// Task-local hook for pre-serialization marking.
+    ///
+    /// Set by transports (e.g., SHM) that need to mark data before sending.
+    /// Called inside `dispatch_call` before the result is serialized.
+    /// Used to transition `ShmBytes` to in-flight state.
+    pub static MARK_IN_FLIGHT_HOOK: MarkInFlightHook;
 }
 
 /// Call the patch hook on the given data, if one is set.
@@ -715,6 +732,17 @@ pub fn call_patch_hook<T: Facet<'static>>(data: &mut T) {
     let _ = PATCH_HOOK.try_with(|hook| {
         let poke = facet::Poke::new(data);
         hook(poke);
+    });
+}
+
+/// Call the mark-in-flight hook on the given data, if one is set.
+///
+/// This is called inside `dispatch_call` before serializing the response.
+/// Transports may also call this before sending any data containing `ShmBytes`.
+pub fn call_mark_in_flight_hook<T: Facet<'static>>(data: &T) {
+    let _ = MARK_IN_FLIGHT_HOOK.try_with(|hook| {
+        let peek = facet::Peek::new(data);
+        hook(peek);
     });
 }
 
@@ -1464,6 +1492,8 @@ where
         debug!("dispatch_call: handler ASYNC finished");
         let (payload, response_channels) = match result {
             Ok(ref ok_result) => {
+                // Mark ShmBytes as in-flight before serialization
+                call_mark_in_flight_hook(ok_result);
                 // Collect channel IDs from the result (e.g., Rx<T> in return type)
                 let channels = collect_channel_ids(ok_result);
                 // Result::Ok(0) + serialized value
@@ -1474,10 +1504,12 @@ where
                 }
                 (out, channels)
             }
-            Err(user_error) => {
+            Err(ref user_error) => {
+                // Mark ShmBytes as in-flight before serialization (errors can contain ShmBytes too)
+                call_mark_in_flight_hook(user_error);
                 // Result::Err(1) + RoamError::User(0) + serialized user error
                 let mut out = vec![1u8, 0u8];
-                match facet_postcard::to_vec(&user_error) {
+                match facet_postcard::to_vec(user_error) {
                     Ok(bytes) => out.extend(bytes),
                     Err(_) => return,
                 }
@@ -1553,6 +1585,9 @@ where
         call_patch_hook(&mut args);
 
         let result = handler(args).await;
+
+        // Mark ShmBytes as in-flight before serialization
+        call_mark_in_flight_hook(&result);
 
         // Collect channel IDs from the result (e.g., Rx<T> in return type)
         let response_channels = collect_channel_ids(&result);

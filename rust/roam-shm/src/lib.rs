@@ -92,7 +92,11 @@ pub use layout::{
 };
 pub use msg::msg_type;
 pub use peer::{PeerEntry, PeerId, PeerState};
-pub use shm_bytes::{ShmBytes, ShmError, SHM_LOCAL_PEER_ID, SHM_POOL, patch_shm_bytes, patch_shm_bytes_hook};
+pub use shm_bytes::{
+    ShmBytes, ShmError, SHM_LOCAL_PEER_ID, SHM_POOL,
+    patch_shm_bytes, patch_shm_bytes_hook,
+    mark_shm_bytes_in_flight, mark_shm_bytes_in_flight_hook,
+};
 pub use var_slot_pool::{SizeClassHeader, VarFreeError, VarSlotHandle, VarSlotPool};
 
 // Re-export MsgDesc from roam-frame

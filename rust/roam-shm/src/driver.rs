@@ -905,15 +905,20 @@ where
         let join_handle = if let Some(pool) = self.var_slot_pool.clone() {
             let local_peer_id = self.local_peer_id;
             // Set SHM_POOL (for ShmBytes::alloc/as_slice/free),
-            // SHM_LOCAL_PEER_ID (for ownership tracking), and
-            // PATCH_HOOK (for patching ShmBytes lengths and claiming ownership after deserialization)
+            // SHM_LOCAL_PEER_ID (for ownership tracking),
+            // PATCH_HOOK (for patching ShmBytes lengths and claiming ownership after deserialization), and
+            // MARK_IN_FLIGHT_HOOK (for marking ShmBytes as in-flight before serialization)
             let fut_with_pool = crate::shm_bytes::SHM_POOL.scope(pool, handler_fut);
             let fut_with_peer_id = crate::shm_bytes::SHM_LOCAL_PEER_ID.scope(local_peer_id, fut_with_pool);
-            let fut_with_hook = roam_session::PATCH_HOOK.scope(
+            let fut_with_patch_hook = roam_session::PATCH_HOOK.scope(
                 crate::shm_bytes::patch_shm_bytes_hook,
                 fut_with_peer_id,
             );
-            tokio::spawn(fut_with_hook)
+            let fut_with_mark_hook = roam_session::MARK_IN_FLIGHT_HOOK.scope(
+                crate::shm_bytes::mark_shm_bytes_in_flight_hook,
+                fut_with_patch_hook,
+            );
+            tokio::spawn(fut_with_mark_hook)
         } else {
             tokio::spawn(handler_fut)
         };
@@ -2438,15 +2443,20 @@ impl MultiPeerHostDriver {
             // Host uses peer ID 0 for ownership tracking
             let local_peer_id: u8 = 0;
             // Set SHM_POOL (for ShmBytes::alloc/as_slice/free),
-            // SHM_LOCAL_PEER_ID (for ownership tracking), and
-            // PATCH_HOOK (for patching ShmBytes lengths and claiming ownership after deserialization)
+            // SHM_LOCAL_PEER_ID (for ownership tracking),
+            // PATCH_HOOK (for patching ShmBytes lengths and claiming ownership after deserialization), and
+            // MARK_IN_FLIGHT_HOOK (for marking ShmBytes as in-flight before serialization)
             let fut_with_pool = crate::shm_bytes::SHM_POOL.scope(pool, handler_fut);
             let fut_with_peer_id = crate::shm_bytes::SHM_LOCAL_PEER_ID.scope(local_peer_id, fut_with_pool);
-            let fut_with_hook = roam_session::PATCH_HOOK.scope(
+            let fut_with_patch_hook = roam_session::PATCH_HOOK.scope(
                 crate::shm_bytes::patch_shm_bytes_hook,
                 fut_with_peer_id,
             );
-            tokio::spawn(fut_with_hook)
+            let fut_with_mark_hook = roam_session::MARK_IN_FLIGHT_HOOK.scope(
+                crate::shm_bytes::mark_shm_bytes_in_flight_hook,
+                fut_with_patch_hook,
+            );
+            tokio::spawn(fut_with_mark_hook)
         } else {
             debug!("handle_incoming_request: NO var_slot_pool, spawning without SHM_POOL scope");
             tokio::spawn(handler_fut)

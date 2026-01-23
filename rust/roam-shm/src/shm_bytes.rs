@@ -301,25 +301,14 @@ impl std::fmt::Debug for ShmBytes {
 
 /// Serialization: `&ShmBytes` -> `ShmBytesWire`
 ///
-/// This automatically marks the slot as in-flight when serializing, transitioning
-/// ownership to the receiver. After serialization, the sender should NOT drop
-/// the `ShmBytes` - the receiver is responsible for freeing it via `claim_in_flight`.
+/// This is a pure data conversion - the mark_in_flight transition is handled
+/// separately by `mark_shm_bytes_in_flight()` which the transport calls before
+/// serialization. This separation prevents side effects during debug printing
+/// or other non-transport serialization.
 impl TryFrom<&ShmBytes> for ShmBytesWire {
     type Error = std::convert::Infallible;
 
     fn try_from(bytes: &ShmBytes) -> Result<Self, Self::Error> {
-        // Automatically mark the slot as in-flight when serializing.
-        // This is a no-op if we're outside an SHM context (task-local not set).
-        if let Err(e) = bytes.mark_in_flight() {
-            // Log but don't fail - if we're not in SHM context, the transport
-            // should reject ShmBytes anyway. If it's a state error (e.g., already
-            // in-flight), that's a programming bug the caller should debug.
-            tracing::warn!(
-                handle = ?bytes.handle,
-                error = ?e,
-                "Failed to mark ShmBytes as in-flight during serialization"
-            );
-        }
         Ok(ShmBytesWire {
             handle: bytes.handle,
             len: bytes.len as u32,
@@ -343,7 +332,91 @@ impl TryFrom<ShmBytesWire> for ShmBytes {
 }
 
 // ============================================================================
-// Hydration Support
+// Mark In-Flight Support (Sender Side)
+// ============================================================================
+
+/// Mark all `ShmBytes` instances in a structure as in-flight before sending.
+///
+/// This walks the structure using facet reflection to find `ShmBytes` fields
+/// and transitions them from `Allocated` to `InFlight` state. Call this
+/// BEFORE serialization in the transport layer.
+///
+/// The separation of marking from proxy conversion prevents side effects when
+/// debug-printing or otherwise serializing `ShmBytes` outside of transport code.
+pub fn mark_shm_bytes_in_flight<T: Facet<'static>>(data: &T) {
+    let _ = SHM_POOL.try_with(|pool| {
+        let peek = facet::Peek::new(data);
+        mark_shm_bytes_recursive(peek, pool);
+    });
+}
+
+/// Hook form of `mark_shm_bytes_in_flight` for use with `MARK_IN_FLIGHT_HOOK`.
+///
+/// This is the function pointer form suitable for use with the dispatch hook mechanism.
+pub fn mark_shm_bytes_in_flight_hook(peek: facet::Peek<'_, '_>) {
+    let _ = SHM_POOL.try_with(|pool| {
+        mark_shm_bytes_recursive(peek, pool);
+    });
+}
+
+fn mark_shm_bytes_recursive(peek: facet::Peek<'_, '_>, pool: &VarSlotPool) {
+    let shape = peek.shape();
+
+    // Check if this is an ShmBytes type
+    if shape.type_identifier == "ShmBytes" {
+        if let Ok(ps) = peek.into_struct() {
+            // Read the handle to mark it
+            let handle_opt = ps
+                .field_by_name("handle")
+                .ok()
+                .and_then(|f| f.get::<VarSlotHandle>().ok().cloned());
+
+            if let Some(handle) = handle_opt {
+                if let Err(e) = pool.mark_in_flight(handle) {
+                    tracing::warn!("Failed to mark ShmBytes handle {:?} as in-flight: {:?}", handle, e);
+                }
+            }
+        }
+        return;
+    }
+
+    // Recurse into Option<T>
+    if let Ok(po) = peek.into_option() {
+        if let Some(inner) = po.value() {
+            mark_shm_bytes_recursive(inner, pool);
+        }
+        return;
+    }
+
+    // Recurse into struct/tuple fields
+    if let Ok(ps) = peek.into_struct() {
+        let field_count = ps.field_count();
+        for i in 0..field_count {
+            if let Ok(field_peek) = ps.field(i) {
+                mark_shm_bytes_recursive(field_peek, pool);
+            }
+        }
+        return;
+    }
+
+    // Recurse into enum variants
+    if let Ok(pe) = peek.into_enum() {
+        if let Ok(Some(variant_peek)) = pe.field(0) {
+            mark_shm_bytes_recursive(variant_peek, pool);
+        }
+        return;
+    }
+
+    // Recurse into sequences (e.g., Vec<ShmBytes>)
+    if let Ok(pl) = peek.into_list() {
+        for element in pl.iter() {
+            mark_shm_bytes_recursive(element, pool);
+        }
+    }
+}
+
+// ============================================================================
+// Hydration Support (Receiver Side)
 // ============================================================================
 
 /// Patch `ShmBytes` instances in deserialized data to claim ownership.
@@ -548,10 +621,10 @@ mod tests {
     }
 
     #[test]
-    fn test_shm_bytes_auto_mark_in_flight_on_serialize() {
+    fn test_mark_shm_bytes_in_flight() {
         use shm_primitives::SlotState;
         
-        // Test that serialization automatically marks the slot as in-flight
+        // Test that mark_shm_bytes_in_flight properly marks slots before serialization
         let (_region, pool) = create_test_pool();
 
         SHM_POOL.sync_scope(Arc::clone(&pool), || {
@@ -564,16 +637,59 @@ mod tests {
                 .expect("meta");
             assert_eq!(meta.state(), SlotState::Allocated);
 
-            // Serialize - this should automatically mark as in-flight
-            let _serialized = facet_postcard::to_vec(&bytes).expect("serialize");
+            // Mark in-flight explicitly (what dispatch_call does before serialization)
+            mark_shm_bytes_in_flight(&bytes);
 
-            // After serialization, state should be InFlight
+            // After marking, state should be InFlight
             assert_eq!(meta.state(), SlotState::InFlight);
+
+            // Serialization should NOT mark again (it's a pure data conversion now)
+            let _serialized = facet_postcard::to_vec(&bytes).expect("serialize");
+            assert_eq!(meta.state(), SlotState::InFlight); // Still InFlight, not double-marked
 
             // Now forget the bytes (ownership transferred to receiver)
             std::mem::forget(bytes);
 
             // Clean up via pool.free() (which expects InFlight state)
+            pool.free(handle).expect("free");
+        });
+    }
+
+    #[test]
+    fn test_mark_shm_bytes_in_struct() {
+        use shm_primitives::SlotState;
+        
+        #[derive(Facet)]
+        struct Container {
+            data: ShmBytes,
+            name: String,
+        }
+
+        let (_region, pool) = create_test_pool();
+
+        SHM_POOL.sync_scope(Arc::clone(&pool), || {
+            let bytes = ShmBytes::alloc(64).expect("alloc");
+            let handle = bytes.handle();
+            
+            let container = Container {
+                data: bytes,
+                name: "test".to_string(),
+            };
+
+            // Verify initial state
+            let meta = pool
+                .slot_meta_ext(handle.class_idx as usize, handle.extent_idx as usize, handle.slot_idx)
+                .expect("meta");
+            assert_eq!(meta.state(), SlotState::Allocated);
+
+            // Mark in-flight via structural walk
+            mark_shm_bytes_in_flight(&container);
+
+            // Should be in-flight now
+            assert_eq!(meta.state(), SlotState::InFlight);
+
+            // Clean up
+            std::mem::forget(container);
             pool.free(handle).expect("free");
         });
     }

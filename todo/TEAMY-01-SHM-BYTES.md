@@ -153,10 +153,12 @@ All core ShmBytes functionality is implemented and tested:
     - `ShmDriver` and `MultiPeerHostDriver` set `SHM_LOCAL_PEER_ID` task-local before dispatch
     - 6 new tests for ownership tracking (3 in shm_bytes, 3 in var_slot_pool)
 
-12. **Auto mark_in_flight on serialization** ([rust/roam-shm/src/shm_bytes.rs](../rust/roam-shm/src/shm_bytes.rs))
-    - `TryFrom<&ShmBytes> for ShmBytesWire` now calls `mark_in_flight()` automatically
-    - Logs warning if SHM_POOL not available (e.g., facet_pretty debug logging on client)
-    - Serialization continues even on failure (transport would reject ShmBytes anyway)
+12. **Explicit mark_in_flight via structural walk** ([rust/roam-shm/src/shm_bytes.rs](../rust/roam-shm/src/shm_bytes.rs), [rust/roam-session/src/lib.rs](../rust/roam-session/src/lib.rs))
+    - `mark_shm_bytes_in_flight()` walks structures to find and mark `ShmBytes` before serialization
+    - `mark_shm_bytes_in_flight_hook()` is the function pointer form for use with `MARK_IN_FLIGHT_HOOK`
+    - `MARK_IN_FLIGHT_HOOK` task-local added to roam-session, called in `dispatch_call`/`dispatch_call_infallible`
+    - `TryFrom<&ShmBytes> for ShmBytesWire` is now a **pure data conversion** with no side effects
+    - This separation prevents debug printing (facet_pretty) from triggering slot state changes
 
 13. **`ShmConnectionHandle` wrapper** ([rust/roam-shm/src/driver.rs](../rust/roam-shm/src/driver.rs))
     - Wraps `ConnectionHandle` + `VarSlotPool` + `local_peer_id`
@@ -209,15 +211,15 @@ All core ShmBytes functionality is implemented and tested:
 
 | File | Change |
 |------|--------|
-| `rust/roam-shm/src/shm_bytes.rs` | ShmBytes type, ShmBytesWire proxy, SHM_POOL, patch_shm_bytes, auto mark_in_flight |
-| `rust/roam-shm/src/lib.rs` | Added shm_bytes module + exports |
+| `rust/roam-shm/src/shm_bytes.rs` | ShmBytes type, ShmBytesWire proxy, SHM_POOL, patch_shm_bytes, mark_shm_bytes_in_flight |
+| `rust/roam-shm/src/lib.rs` | Added shm_bytes module + exports (including mark_shm_bytes_in_flight_hook) |
 | `rust/roam-shm/src/var_slot_pool.rs` | Added `#[derive(Facet)]` to VarSlotHandle, `from_segment()`, `claim_in_flight()` |
 | `rust/roam-shm/src/host.rs` | Added `var_slot_pool` field/accessor |
-| `rust/roam-shm/src/driver.rs` | **NEW** `ShmConnectionHandle`, updated establish functions, task-local scopes |
+| `rust/roam-shm/src/driver.rs` | **NEW** `ShmConnectionHandle`, updated establish functions, task-local scopes (PATCH_HOOK + MARK_IN_FLIGHT_HOOK) |
 | `rust/roam-shm/src/guest.rs` | Added `var_slot_pool` field/accessor |
 | `rust/roam-shm/src/transport.rs` | Added `var_slot_pool()` and `peer_id()` accessors |
 | `rust/roam-shm/src/layout.rs` | Added `var_slot_class_count` to header |
-| `rust/roam-session/src/lib.rs` | `PATCH_HOOK`, `Caller::patch_response`, `Caller::call` returns `Send` future, `call_raw_with_channels` public |
+| `rust/roam-session/src/lib.rs` | `PATCH_HOOK`, `MARK_IN_FLIGHT_HOOK`, `Caller::patch_response`, `call_mark_in_flight_hook`, `Caller::call` returns `Send` future |
 | `rust/roam-session/src/driver.rs` | `FramedClient` impl of `Caller` with `Send` future |
 | `rust/roam-stream/src/driver.rs` | `Client` impl of `Caller` with `Send` future |
 | `rust/roam-macros/src/lib.rs` | Generated client calls `Caller::patch_response` after decode |
@@ -228,12 +230,10 @@ All core ShmBytes functionality is implemented and tested:
 ## Next Steps
 
 1. **Error on non-SHM** - Make stream transport reject ShmBytes gracefully
-2. **Consider suppressing `mark_in_flight` warnings** - These warnings from facet_pretty debug logging are noisy but harmless
 
 ## Known Issues
 
 - **Pre-existing deadlock in slot exhaustion + streaming**: Tests `mixed_calls_with_slot_exhaustion` and `slot_exhaustion_should_not_corrupt_channel_state` are ignored due to a deadlock when slots are exhausted while guest handlers await streaming data. Not related to ShmBytes work.
-- **facet_pretty triggers proxy conversion**: Debug logging of ShmBytes on client side calls `mark_in_flight()` where SHM_POOL isn't set. Currently just logs a warning. The warning is harmless - the slot is already InFlight at this point.
 - Some tests are verbose, so to avoid wasting tokens please always use a filter when running tests with tracing feature enabled. Example: `| Select-String -Pattern "(FAILED|PASSED|error|^test result|running \d+ test)"`. You do not need to filter the output of `cargo build`.
 - **Tracing tests can be flaky** when run in parallel - use `--test-threads=1` if needed.
 

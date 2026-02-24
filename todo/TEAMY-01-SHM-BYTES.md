@@ -229,7 +229,7 @@ All core ShmBytes functionality is implemented and tested:
 
 ## Next Steps
 
-1. **Error on non-SHM** - Make stream transport reject ShmBytes gracefully
+1. **Error on non-SHM** - Make stream transport reject ShmBytes gracefully. Alternatively, gracefully fall back to using full clones of bytes.
 
 ## Known Issues
 
